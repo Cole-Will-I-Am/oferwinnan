@@ -110,7 +110,8 @@ class Stream:
             self.respawn_delay = random.randint(2, 30)
             self.trail.clear()
 
-    def render(self, buf):
+    def render(self, cells):
+        """Populate cells dict with {(row, col): ansi_string} for this frame."""
         n = len(self.trail)
         if n == 0:
             return
@@ -125,17 +126,17 @@ class Stream:
 
             if i == n - 1:
                 # Head: white-hot
-                buf.append(f"{move(row, self.col)}{bold()}{fg(220, 255, 220)}{glyph}")
+                cells[(row, self.col)] = f"{bold()}{fg(220, 255, 220)}{glyph}"
             elif i >= n - 3:
                 # Near-head: bright green
-                buf.append(f"{move(row, self.col)}{bold()}{fg(0, 230, 50)}{glyph}")
+                cells[(row, self.col)] = f"{bold()}{fg(0, 230, 50)}{glyph}"
             elif i >= n // 2:
                 # Mid-trail: medium green
-                buf.append(f"{move(row, self.col)}{fg(0, 180, 30)}{glyph}")
+                cells[(row, self.col)] = f"{fg(0, 180, 30)}{glyph}"
             else:
                 # Tail: dim, fading
                 intensity = max(30, int(80 * (i / max(1, n // 2))))
-                buf.append(f"{move(row, self.col)}{dim()}{fg(0, intensity, 0)}{glyph}")
+                cells[(row, self.col)] = f"{dim()}{fg(0, intensity, 0)}{glyph}"
 
 
 # ─── Engine ──────────────────────────────────────────────────────────────────
@@ -146,6 +147,7 @@ class MatrixRain:
         self.cols = 0
         self.rows = 0
         self.streams = []
+        self.prev_cells = {}
         self._detect_size()
         self._init_streams()
 
@@ -168,6 +170,7 @@ class MatrixRain:
         self._detect_size()
         if self.cols != old_cols or self.rows != old_rows:
             self._init_streams()
+            self.prev_cells.clear()
             sys.stdout.write(CLEAR)
 
     def run(self):
@@ -186,14 +189,29 @@ class MatrixRain:
 
                 self._handle_resize()
 
-                buf = [HOME]
+                # Collect current frame cells
+                cur_cells = {}
                 for stream in self.streams:
                     stream.update()
-                    stream.render(buf)
+                    stream.render(cur_cells)
+
+                buf = []
+
+                # Erase cells that were occupied last frame but aren't now
+                for pos in self.prev_cells:
+                    if pos not in cur_cells:
+                        buf.append(f"{move(pos[0], pos[1])}{RESET} ")
+
+                # Draw current cells
+                for pos, content in cur_cells.items():
+                    buf.append(f"{move(pos[0], pos[1])}{content}")
+
                 buf.append(RESET)
 
                 sys.stdout.write("".join(buf))
                 sys.stdout.flush()
+
+                self.prev_cells = cur_cells
 
                 elapsed = time.monotonic() - t0
                 sleep = frame_time - elapsed
