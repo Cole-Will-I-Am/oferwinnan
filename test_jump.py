@@ -31,6 +31,8 @@ if CRYPTOGRAPHY_AVAILABLE:
     from session_jumper import (
     JumpSession, capture_session, restore_session,
     send_session, receive_session, JumpNode,
+    MultiJumpStrategy, MultiJumpResult, TargetResult,
+    jump_to_devices, _jump_single,
 )
 
 else:
@@ -477,6 +479,424 @@ class TestSessionTransfer(unittest.TestCase):
         self.assertEqual(received[0].cwd, "/tmp/test")
         self.assertEqual(received[0].env["FOO"], "bar")
         self.assertEqual(received[0].metadata["purpose"], "testing")
+
+
+# ── Multi-Jump (Multiply / Duplicate) Tests ─────────────────────────────────
+
+@unittest.skipUnless(CRYPTOGRAPHY_AVAILABLE, "cryptography not installed")
+class TestMultiJumpResult(unittest.TestCase):
+    def test_result_properties_all_success(self):
+        targets = [
+            TargetResult(
+                device=Device("d1", "Dev1", "1.1.1.1", Transport.WIFI,
+                              port=47701, last_seen=time.time()),
+                success=True, elapsed=0.5,
+            ),
+            TargetResult(
+                device=Device("d2", "Dev2", "1.1.1.2", Transport.WIFI,
+                              port=47701, last_seen=time.time()),
+                success=True, elapsed=0.3,
+            ),
+        ]
+        r = MultiJumpResult(
+            strategy=MultiJumpStrategy.BROADCAST,
+            session_id="test-multi",
+            targets=targets,
+            started=100.0, finished=101.0,
+        )
+        self.assertTrue(r.all_ok)
+        self.assertTrue(r.any_ok)
+        self.assertEqual(len(r.succeeded), 2)
+        self.assertEqual(len(r.failed), 0)
+        self.assertAlmostEqual(r.total_elapsed, 1.0)
+        self.assertIn("BROADCAST", r.summary())
+        self.assertIn("2/2", r.summary())
+
+    def test_result_properties_partial_failure(self):
+        targets = [
+            TargetResult(
+                device=Device("d1", "Dev1", "1.1.1.1", Transport.WIFI,
+                              port=47701, last_seen=time.time()),
+                success=True, elapsed=0.5,
+            ),
+            TargetResult(
+                device=Device("d2", "Dev2", "1.1.1.2", Transport.WIFI,
+                              port=47701, last_seen=time.time()),
+                success=False, elapsed=1.0, error="Connection refused",
+            ),
+        ]
+        r = MultiJumpResult(
+            strategy=MultiJumpStrategy.MIRROR,
+            session_id="test-partial",
+            targets=targets,
+            started=100.0, finished=102.0,
+        )
+        self.assertFalse(r.all_ok)
+        self.assertTrue(r.any_ok)
+        self.assertEqual(len(r.succeeded), 1)
+        self.assertEqual(len(r.failed), 1)
+
+    def test_result_empty_targets(self):
+        r = MultiJumpResult(
+            strategy=MultiJumpStrategy.RACE,
+            session_id="empty",
+            targets=[],
+            started=100.0, finished=100.0,
+        )
+        self.assertTrue(r.all_ok)  # vacuously true for empty list with all()
+        self.assertFalse(r.any_ok)
+        self.assertIn("0/0", r.summary())
+
+
+@unittest.skipUnless(CRYPTOGRAPHY_AVAILABLE, "cryptography not installed")
+class TestMultiJumpStrategy(unittest.TestCase):
+    def test_strategy_values(self):
+        self.assertEqual(MultiJumpStrategy.BROADCAST.value, "broadcast")
+        self.assertEqual(MultiJumpStrategy.MIRROR.value, "mirror")
+        self.assertEqual(MultiJumpStrategy.RACE.value, "race")
+        self.assertEqual(MultiJumpStrategy.CASCADE.value, "cascade")
+
+    def test_strategy_from_string(self):
+        self.assertEqual(MultiJumpStrategy("broadcast"), MultiJumpStrategy.BROADCAST)
+        self.assertEqual(MultiJumpStrategy("cascade"), MultiJumpStrategy.CASCADE)
+
+
+@unittest.skipUnless(CRYPTOGRAPHY_AVAILABLE, "cryptography not installed")
+class TestJumpToDevicesEmpty(unittest.TestCase):
+    def test_empty_targets(self):
+        session = JumpSession(session_id="empty-test", source_device="src")
+        session.checksum = session.compute_checksum()
+        result = jump_to_devices([], session)
+        self.assertEqual(len(result.targets), 0)
+        self.assertEqual(result.strategy, MultiJumpStrategy.BROADCAST)
+
+
+@unittest.skipUnless(CRYPTOGRAPHY_AVAILABLE, "cryptography not installed")
+class TestMultiJumpBroadcast(unittest.TestCase):
+    """End-to-end broadcast to multiple listeners over real sockets."""
+
+    def _start_listener(self):
+        """Start a JumpListener on an ephemeral port, return (port, listener, received_list)."""
+        received = []
+
+        def on_conn(conn):
+            try:
+                session = receive_session(conn)
+                received.append(session)
+            except Exception:
+                pass
+            finally:
+                conn.close()
+
+        listener = JumpListener(port=0, on_connection=on_conn)
+        # Bind to ephemeral port
+        listener._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener._server_sock.bind(("127.0.0.1", 0))
+        port = listener._server_sock.getsockname()[1]
+        listener._server_sock.listen(5)
+        listener._server_sock.settimeout(2.0)
+        listener._running = True
+        listener._thread = threading.Thread(target=listener._accept_loop, daemon=True)
+        listener._thread.start()
+        return port, listener, received
+
+    def test_broadcast_two_targets(self):
+        port1, l1, recv1 = self._start_listener()
+        port2, l2, recv2 = self._start_listener()
+
+        try:
+            targets = [
+                Device("t1", "Target1", "127.0.0.1", Transport.WIFI,
+                       port=port1, last_seen=time.time()),
+                Device("t2", "Target2", "127.0.0.1", Transport.WIFI,
+                       port=port2, last_seen=time.time()),
+            ]
+            session = JumpSession(
+                session_id="broadcast-e2e",
+                source_device="sender",
+                timestamp=time.time(),
+                cwd="/tmp",
+                metadata={"multi_jump": True},
+            )
+            session.checksum = session.compute_checksum()
+
+            result = jump_to_devices(targets, session,
+                                     strategy=MultiJumpStrategy.BROADCAST)
+
+            self.assertEqual(len(result.targets), 2)
+            self.assertTrue(result.all_ok, f"Failures: {[t.error for t in result.failed]}")
+            self.assertEqual(result.strategy, MultiJumpStrategy.BROADCAST)
+
+            # Wait briefly for async receive
+            time.sleep(0.5)
+            self.assertEqual(len(recv1), 1)
+            self.assertEqual(recv1[0].session_id, "broadcast-e2e")
+            self.assertEqual(len(recv2), 1)
+            self.assertEqual(recv2[0].session_id, "broadcast-e2e")
+        finally:
+            l1.stop()
+            l2.stop()
+
+    def test_broadcast_with_one_failure(self):
+        port1, l1, recv1 = self._start_listener()
+
+        try:
+            targets = [
+                Device("t1", "Target1", "127.0.0.1", Transport.WIFI,
+                       port=port1, last_seen=time.time()),
+                Device("t2", "BadTarget", "127.0.0.1", Transport.WIFI,
+                       port=1, last_seen=time.time()),  # port 1 = will fail
+            ]
+            session = JumpSession(
+                session_id="partial-e2e",
+                source_device="sender",
+            )
+            session.checksum = session.compute_checksum()
+
+            result = jump_to_devices(targets, session,
+                                     strategy=MultiJumpStrategy.BROADCAST)
+
+            self.assertEqual(len(result.targets), 2)
+            self.assertTrue(result.any_ok)
+            self.assertFalse(result.all_ok)
+            self.assertEqual(len(result.succeeded), 1)
+            self.assertEqual(len(result.failed), 1)
+        finally:
+            l1.stop()
+
+    def test_broadcast_progress_callback(self):
+        port1, l1, _ = self._start_listener()
+        progress_calls = []
+
+        def on_progress(tr, done, total):
+            progress_calls.append((tr.device.name, done, total))
+
+        try:
+            targets = [
+                Device("t1", "Target1", "127.0.0.1", Transport.WIFI,
+                       port=port1, last_seen=time.time()),
+            ]
+            session = JumpSession(session_id="progress-test",
+                                  source_device="sender")
+            session.checksum = session.compute_checksum()
+
+            jump_to_devices(targets, session, on_progress=on_progress)
+            self.assertEqual(len(progress_calls), 1)
+            self.assertEqual(progress_calls[0][1], 1)  # done
+            self.assertEqual(progress_calls[0][2], 1)  # total
+        finally:
+            l1.stop()
+
+
+@unittest.skipUnless(CRYPTOGRAPHY_AVAILABLE, "cryptography not installed")
+class TestMultiJumpCascade(unittest.TestCase):
+    def _start_listener(self):
+        received = []
+
+        def on_conn(conn):
+            try:
+                received.append(receive_session(conn))
+            except Exception:
+                pass
+            finally:
+                conn.close()
+
+        listener = JumpListener(port=0, on_connection=on_conn)
+        listener._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener._server_sock.bind(("127.0.0.1", 0))
+        port = listener._server_sock.getsockname()[1]
+        listener._server_sock.listen(5)
+        listener._server_sock.settimeout(2.0)
+        listener._running = True
+        listener._thread = threading.Thread(target=listener._accept_loop, daemon=True)
+        listener._thread.start()
+        return port, listener, received
+
+    def test_cascade_stops_on_failure(self):
+        port1, l1, recv1 = self._start_listener()
+
+        try:
+            targets = [
+                Device("t1", "Target1", "127.0.0.1", Transport.WIFI,
+                       port=port1, last_seen=time.time()),
+                Device("bad", "BadTarget", "127.0.0.1", Transport.WIFI,
+                       port=1, last_seen=time.time()),
+                Device("t3", "NeverReached", "127.0.0.1", Transport.WIFI,
+                       port=port1, last_seen=time.time()),
+            ]
+            session = JumpSession(session_id="cascade-stop",
+                                  source_device="sender")
+            session.checksum = session.compute_checksum()
+
+            result = jump_to_devices(targets, session,
+                                     strategy=MultiJumpStrategy.CASCADE)
+
+            # Should have attempted 2 (first success, second failure, third skipped)
+            self.assertEqual(len(result.targets), 2)
+            self.assertTrue(result.targets[0].success)
+            self.assertFalse(result.targets[1].success)
+        finally:
+            l1.stop()
+
+    def test_cascade_all_succeed(self):
+        port1, l1, recv1 = self._start_listener()
+        port2, l2, recv2 = self._start_listener()
+
+        try:
+            targets = [
+                Device("t1", "First", "127.0.0.1", Transport.WIFI,
+                       port=port1, last_seen=time.time()),
+                Device("t2", "Second", "127.0.0.1", Transport.WIFI,
+                       port=port2, last_seen=time.time()),
+            ]
+            session = JumpSession(session_id="cascade-ok",
+                                  source_device="sender")
+            session.checksum = session.compute_checksum()
+
+            result = jump_to_devices(targets, session,
+                                     strategy=MultiJumpStrategy.CASCADE)
+
+            self.assertEqual(len(result.targets), 2)
+            self.assertTrue(result.all_ok)
+            time.sleep(0.5)
+            self.assertEqual(len(recv1), 1)
+            self.assertEqual(len(recv2), 1)
+        finally:
+            l1.stop()
+            l2.stop()
+
+
+@unittest.skipUnless(CRYPTOGRAPHY_AVAILABLE, "cryptography not installed")
+class TestMultiJumpRace(unittest.TestCase):
+    def _start_listener(self):
+        received = []
+
+        def on_conn(conn):
+            try:
+                received.append(receive_session(conn))
+            except Exception:
+                pass
+            finally:
+                conn.close()
+
+        listener = JumpListener(port=0, on_connection=on_conn)
+        listener._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener._server_sock.bind(("127.0.0.1", 0))
+        port = listener._server_sock.getsockname()[1]
+        listener._server_sock.listen(5)
+        listener._server_sock.settimeout(2.0)
+        listener._running = True
+        listener._thread = threading.Thread(target=listener._accept_loop, daemon=True)
+        listener._thread.start()
+        return port, listener, received
+
+    def test_race_at_least_one_succeeds(self):
+        port1, l1, recv1 = self._start_listener()
+        port2, l2, recv2 = self._start_listener()
+
+        try:
+            targets = [
+                Device("t1", "Racer1", "127.0.0.1", Transport.WIFI,
+                       port=port1, last_seen=time.time()),
+                Device("t2", "Racer2", "127.0.0.1", Transport.WIFI,
+                       port=port2, last_seen=time.time()),
+            ]
+            session = JumpSession(session_id="race-test",
+                                  source_device="sender")
+            session.checksum = session.compute_checksum()
+
+            result = jump_to_devices(targets, session,
+                                     strategy=MultiJumpStrategy.RACE)
+
+            self.assertTrue(result.any_ok)
+            self.assertGreaterEqual(len(result.succeeded), 1)
+        finally:
+            l1.stop()
+            l2.stop()
+
+
+@unittest.skipUnless(CRYPTOGRAPHY_AVAILABLE, "cryptography not installed")
+class TestMultiJumpNodeIntegration(unittest.TestCase):
+    """Test the JumpNode.multi_jump() method."""
+
+    def _start_listener(self):
+        received = []
+
+        def on_conn(conn):
+            try:
+                received.append(receive_session(conn))
+            except Exception:
+                pass
+            finally:
+                conn.close()
+
+        listener = JumpListener(port=0, on_connection=on_conn)
+        listener._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener._server_sock.bind(("127.0.0.1", 0))
+        port = listener._server_sock.getsockname()[1]
+        listener._server_sock.listen(5)
+        listener._server_sock.settimeout(2.0)
+        listener._running = True
+        listener._thread = threading.Thread(target=listener._accept_loop, daemon=True)
+        listener._thread.start()
+        return port, listener, received
+
+    def test_node_multi_jump_no_targets(self):
+        node = JumpNode(listen_port=0)
+        result = node.multi_jump(targets=[])
+        self.assertEqual(len(result.targets), 0)
+
+    def test_node_multi_jump_broadcast(self):
+        port1, l1, recv1 = self._start_listener()
+        port2, l2, recv2 = self._start_listener()
+
+        try:
+            node = JumpNode(listen_port=0)
+            targets = [
+                Device("t1", "N1", "127.0.0.1", Transport.WIFI,
+                       port=port1, last_seen=time.time()),
+                Device("t2", "N2", "127.0.0.1", Transport.WIFI,
+                       port=port2, last_seen=time.time()),
+            ]
+            result = node.multi_jump(
+                targets=targets,
+                strategy=MultiJumpStrategy.BROADCAST,
+                extra_metadata={"source": "test"},
+            )
+            self.assertTrue(result.all_ok)
+            self.assertEqual(len(result.succeeded), 2)
+            self.assertTrue(result.session_id.startswith("multi-"))
+
+            time.sleep(0.5)
+            self.assertEqual(len(recv1), 1)
+            self.assertEqual(len(recv2), 1)
+            # Verify metadata propagation
+            self.assertTrue(recv1[0].metadata.get("multi_jump"))
+            self.assertEqual(recv1[0].metadata["strategy"], "broadcast")
+            self.assertEqual(recv1[0].metadata["target_count"], 2)
+        finally:
+            l1.stop()
+            l2.stop()
+
+
+@unittest.skipUnless(CRYPTOGRAPHY_AVAILABLE, "cryptography not installed")
+class TestJumpSingleRetry(unittest.TestCase):
+    def test_retry_on_failure(self):
+        bad_target = Device("bad", "Unreachable", "127.0.0.1", Transport.WIFI,
+                            port=1, last_seen=time.time())
+        session = JumpSession(session_id="retry-test", source_device="src")
+        session.checksum = session.compute_checksum()
+
+        result = _jump_single(bad_target, session, timeout=1, max_retries=1)
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.retries, 1)
+        self.assertIsNotNone(result.error)
+        self.assertGreater(result.elapsed, 0)
 
 
 if __name__ == "__main__":

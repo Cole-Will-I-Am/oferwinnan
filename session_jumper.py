@@ -12,10 +12,13 @@ import json
 import logging
 import os
 import socket
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
+from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from device_discovery import Device, Transport, DiscoveryManager
 from jump_protocol import (
@@ -228,6 +231,208 @@ class JumpError(Exception):
     pass
 
 
+# ── Multi-target Jump (Multiply / Duplicate) ────────────────────────────────
+
+class MultiJumpStrategy(Enum):
+    """Strategy for dispatching a session to multiple targets."""
+    BROADCAST = "broadcast"   # Fire-and-forget to all; collect results
+    MIRROR = "mirror"         # All must succeed or the whole operation fails
+    RACE = "race"             # First successful delivery wins; cancel the rest
+    CASCADE = "cascade"       # Sequential: each target only after the previous succeeds
+
+
+@dataclass
+class TargetResult:
+    """Outcome of a jump attempt to a single target."""
+    device: Device
+    success: bool
+    elapsed: float = 0.0
+    error: Optional[str] = None
+    retries: int = 0
+
+
+@dataclass
+class MultiJumpResult:
+    """Aggregate outcome of a multi-target jump."""
+    strategy: MultiJumpStrategy
+    session_id: str
+    targets: list  # list[TargetResult]
+    started: float = 0.0
+    finished: float = 0.0
+
+    @property
+    def succeeded(self) -> list:
+        return [t for t in self.targets if t.success]
+
+    @property
+    def failed(self) -> list:
+        return [t for t in self.targets if not t.success]
+
+    @property
+    def total_elapsed(self) -> float:
+        return self.finished - self.started if self.finished else 0.0
+
+    @property
+    def all_ok(self) -> bool:
+        return all(t.success for t in self.targets)
+
+    @property
+    def any_ok(self) -> bool:
+        return any(t.success for t in self.targets)
+
+    def summary(self) -> str:
+        ok = len(self.succeeded)
+        fail = len(self.failed)
+        return (
+            f"[{self.strategy.value.upper()}] {ok}/{ok + fail} targets reached "
+            f"in {self.total_elapsed:.2f}s (session {self.session_id})"
+        )
+
+
+def _jump_single(
+    target: Device,
+    session: JumpSession,
+    auth_token: str = None,
+    timeout: float = 30.0,
+    max_retries: int = 0,
+) -> TargetResult:
+    """Jump to one target with optional retries. Returns a TargetResult."""
+    t0 = time.time()
+    last_err = None
+    for attempt in range(1 + max_retries):
+        try:
+            ok = jump_to_device(target, session, auth_token=auth_token,
+                                timeout=timeout)
+            return TargetResult(
+                device=target, success=ok,
+                elapsed=time.time() - t0, retries=attempt,
+            )
+        except (JumpError, OSError, ConnectionError) as exc:
+            last_err = exc
+            if attempt < max_retries:
+                time.sleep(min(2 ** attempt, 8))
+    return TargetResult(
+        device=target, success=False,
+        elapsed=time.time() - t0,
+        error=str(last_err), retries=max_retries,
+    )
+
+
+def jump_to_devices(
+    targets: list,
+    session: JumpSession,
+    *,
+    strategy: MultiJumpStrategy = MultiJumpStrategy.BROADCAST,
+    auth_token: str = None,
+    timeout: float = 30.0,
+    max_retries: int = 0,
+    max_workers: int = 0,
+    on_progress: Callable[[TargetResult, int, int], None] = None,
+) -> MultiJumpResult:
+    """Jump a session to multiple targets using the chosen strategy.
+
+    Args:
+        targets: Devices to send the session to.
+        session: The session to transfer.
+        strategy: Dispatch strategy (BROADCAST, MIRROR, RACE, CASCADE).
+        auth_token: Shared auth token for all targets.
+        timeout: Per-target TCP timeout.
+        max_retries: Per-target retry count (with exponential backoff).
+        max_workers: Thread pool size (0 = len(targets)).
+        on_progress: Callback(result, completed_count, total) after each target.
+
+    Returns:
+        MultiJumpResult with per-target outcomes.
+    """
+    if not targets:
+        return MultiJumpResult(
+            strategy=strategy, session_id=session.session_id,
+            targets=[], started=time.time(), finished=time.time(),
+        )
+
+    workers = max_workers or min(len(targets), 16)
+    result = MultiJumpResult(
+        strategy=strategy, session_id=session.session_id,
+        targets=[], started=time.time(),
+    )
+
+    if strategy == MultiJumpStrategy.CASCADE:
+        return _cascade_jump(targets, session, result,
+                             auth_token, timeout, max_retries, on_progress)
+
+    if strategy == MultiJumpStrategy.RACE:
+        return _race_jump(targets, session, result, workers,
+                          auth_token, timeout, max_retries, on_progress)
+
+    # BROADCAST and MIRROR: dispatch all concurrently
+    completed = 0
+    cancel = threading.Event()
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(_jump_single, t, session, auth_token, timeout,
+                        max_retries): t
+            for t in targets
+        }
+        for future in as_completed(futures):
+            tr = future.result()
+            result.targets.append(tr)
+            completed += 1
+            if on_progress:
+                on_progress(tr, completed, len(targets))
+            # MIRROR: abort early on first failure
+            if strategy == MultiJumpStrategy.MIRROR and not tr.success:
+                cancel.set()
+                for f in futures:
+                    f.cancel()
+                break
+
+    result.finished = time.time()
+    return result
+
+
+def _cascade_jump(targets, session, result, auth_token, timeout,
+                  max_retries, on_progress):
+    """Sequential jump — each target only attempted after the previous succeeds."""
+    for i, target in enumerate(targets):
+        tr = _jump_single(target, session, auth_token, timeout, max_retries)
+        result.targets.append(tr)
+        if on_progress:
+            on_progress(tr, i + 1, len(targets))
+        if not tr.success:
+            break
+    result.finished = time.time()
+    return result
+
+
+def _race_jump(targets, session, result, workers, auth_token, timeout,
+               max_retries, on_progress):
+    """First successful delivery wins; remaining futures are cancelled."""
+    winner_found = threading.Event()
+
+    def _race_single(target):
+        if winner_found.is_set():
+            return TargetResult(device=target, success=False,
+                                error="cancelled (race lost)")
+        tr = _jump_single(target, session, auth_token, timeout, max_retries)
+        if tr.success:
+            winner_found.set()
+        return tr
+
+    completed = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_race_single, t): t for t in targets}
+        for future in as_completed(futures):
+            tr = future.result()
+            result.targets.append(tr)
+            completed += 1
+            if on_progress:
+                on_progress(tr, completed, len(targets))
+
+    result.finished = time.time()
+    return result
+
+
 class JumpNode:
     """A node that can both send and receive jump sessions."""
 
@@ -286,3 +491,68 @@ class JumpNode:
             extra_metadata=extra_metadata,
         )
         return jump_to_device(target, session, auth_token=self.auth_token)
+
+    def multi_jump(
+        self,
+        targets: list = None,
+        *,
+        strategy: MultiJumpStrategy = MultiJumpStrategy.BROADCAST,
+        session_id: str = None,
+        include_env: bool = True,
+        include_files: list[str] = None,
+        extra_metadata: dict = None,
+        max_retries: int = 0,
+        max_workers: int = 0,
+        on_progress: Callable[[TargetResult, int, int], None] = None,
+    ) -> MultiJumpResult:
+        """Multiply / duplicate this session to multiple targets.
+
+        Args:
+            targets: Devices to jump to. If None, discovers all available.
+            strategy: BROADCAST, MIRROR, RACE, or CASCADE.
+            session_id: Custom session ID.
+            include_env: Include environment variables.
+            include_files: Files to attach.
+            extra_metadata: Arbitrary metadata dict.
+            max_retries: Per-target retries with exponential backoff.
+            max_workers: Thread pool size (0 = auto).
+            on_progress: Callback after each target completes.
+
+        Returns:
+            MultiJumpResult with per-target outcomes.
+        """
+        if targets is None:
+            targets = self.discover_targets()
+
+        if not targets:
+            logger.warning("multi_jump: no targets found")
+            return MultiJumpResult(
+                strategy=strategy,
+                session_id=session_id or "empty",
+                targets=[],
+                started=time.time(),
+                finished=time.time(),
+            )
+
+        sid = session_id or f"multi-{int(time.time())}"
+        session = capture_session(
+            session_id=sid,
+            source_device=self.discovery.node_id,
+            include_env=include_env,
+            include_files=include_files,
+            extra_metadata={
+                **(extra_metadata or {}),
+                "multi_jump": True,
+                "strategy": strategy.value,
+                "target_count": len(targets),
+            },
+        )
+
+        return jump_to_devices(
+            targets, session,
+            strategy=strategy,
+            auth_token=self.auth_token,
+            max_retries=max_retries,
+            max_workers=max_workers,
+            on_progress=on_progress,
+        )

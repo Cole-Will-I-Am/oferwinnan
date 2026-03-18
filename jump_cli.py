@@ -20,6 +20,7 @@ import time
 from device_discovery import Device, Transport, DiscoveryManager
 from session_jumper import (
     JumpNode, JumpSession, restore_session, JumpError,
+    MultiJumpStrategy, MultiJumpResult, TargetResult,
 )
 
 logger = logging.getLogger(__name__)
@@ -130,6 +131,79 @@ def cmd_jump(args):
         node.stop()
 
 
+def cmd_multiply(args):
+    """Multiply/duplicate the session to multiple targets simultaneously."""
+    node = JumpNode(
+        listen_port=args.port,
+        auth_token=args.token,
+    )
+    node.start()
+
+    strategy = MultiJumpStrategy(args.strategy)
+
+    # Resolve targets
+    if args.all:
+        logger.info("Discovering all nearby devices...")
+        time.sleep(min(args.discovery_timeout, 10))
+        targets = node.discover_targets()
+        if not targets:
+            logger.error("No devices found on the network.")
+            node.stop()
+            sys.exit(1)
+        logger.info(f"Found {len(targets)} device(s)")
+    elif args.targets:
+        targets = []
+        for t in args.targets:
+            dev = _resolve_target(t, node, timeout=5)
+            if dev:
+                targets.append(dev)
+            else:
+                logger.warning(f"Could not resolve target '{t}', skipping")
+        if not targets:
+            logger.error("No valid targets resolved.")
+            node.stop()
+            sys.exit(1)
+    else:
+        logger.error("Specify --targets or --all")
+        node.stop()
+        sys.exit(1)
+
+    logger.info(f"Strategy: {strategy.value.upper()}")
+    logger.info(f"Targets:  {len(targets)}")
+    for dev in targets:
+        logger.info(f"  - {dev.name} ({dev.address}:{dev.port})")
+
+    files = args.files or []
+    metadata = {"jump_reason": args.reason} if args.reason else {}
+
+    def on_progress(tr: TargetResult, done: int, total: int):
+        status = "OK" if tr.success else f"FAIL ({tr.error})"
+        retries = f" (retries: {tr.retries})" if tr.retries else ""
+        logger.info(
+            f"  [{done}/{total}] {tr.device.name}: {status} "
+            f"({tr.elapsed:.2f}s){retries}"
+        )
+
+    try:
+        result = node.multi_jump(
+            targets=targets,
+            strategy=strategy,
+            include_env=not args.no_env,
+            include_files=files,
+            extra_metadata=metadata,
+            max_retries=args.retries,
+            on_progress=on_progress,
+        )
+        logger.info(f"\n{result.summary()}")
+        if not result.any_ok:
+            sys.exit(1)
+    except JumpError as e:
+        logger.error(f"Multiply failed: {e}")
+        sys.exit(1)
+    finally:
+        node.stop()
+
+
 def cmd_status(args):
     """Show the status of this node."""
     discovery = DiscoveryManager(node_name=args.name or socket.gethostname(), listen_port=args.port)
@@ -218,6 +292,25 @@ def main():
                         help="Don't transfer environment variables")
     p_jump.add_argument("--reason", type=str, help="Jump reason metadata")
 
+    # multiply (multi-target jump)
+    p_multi = sub.add_parser("multiply",
+                             help="Duplicate session to multiple targets")
+    p_multi.add_argument("--targets", nargs="*",
+                         help="Target devices (IP:PORT or names)")
+    p_multi.add_argument("--all", action="store_true",
+                         help="Jump to all discovered devices")
+    p_multi.add_argument("--strategy", default="broadcast",
+                         choices=["broadcast", "mirror", "race", "cascade"],
+                         help="Dispatch strategy (default: broadcast)")
+    p_multi.add_argument("--files", nargs="*", help="Files to include")
+    p_multi.add_argument("--no-env", action="store_true",
+                         help="Don't transfer environment variables")
+    p_multi.add_argument("--reason", type=str, help="Jump reason metadata")
+    p_multi.add_argument("--retries", type=int, default=0,
+                         help="Per-target retry count (default: 0)")
+    p_multi.add_argument("--discovery-timeout", type=int, default=5,
+                         help="Seconds to wait for device discovery (default: 5)")
+
     # status
     p_status = sub.add_parser("status", help="Show node status")
 
@@ -227,6 +320,7 @@ def main():
         "listen": cmd_listen,
         "discover": cmd_discover,
         "jump": cmd_jump,
+        "multiply": cmd_multiply,
         "status": cmd_status,
     }
     commands[args.command](args)
