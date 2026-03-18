@@ -126,6 +126,18 @@ class TestMirrorFunction(unittest.TestCase):
         with self.assertRaises(MirrorError):
             self.registry.mirror(42)
 
+    def test_mirror_lambda(self):
+        fn = lambda value: value + 1  # noqa: E731
+        mirror = self.registry.mirror(fn)
+        self.assertEqual(mirror(4), 5)
+
+    def test_mirror_builtin_callable(self):
+        try:
+            mirror = self.registry.mirror(len)
+        except MirrorError:
+            return
+        self.assertEqual(mirror([1, 2, 3]), 3)
+
     def test_clear(self):
         self.registry.mirror(sample_add)
         self.registry.mirror(sample_greet)
@@ -193,6 +205,22 @@ class TestMirrorHooks(unittest.TestCase):
 
         mirror = self.registry.mirror(sample_add, post=post)
         self.assertEqual(mirror(2, 3), 5)
+
+    def test_pre_hook_exception_propagates(self):
+        def pre(fn, args, kwargs):
+            raise RuntimeError("pre boom")
+
+        mirror = self.registry.mirror(sample_add, pre=pre)
+        with self.assertRaisesRegex(RuntimeError, "pre boom"):
+            mirror(1, 2)
+
+    def test_post_hook_exception_propagates(self):
+        def post(fn, result):
+            raise RuntimeError("post boom")
+
+        mirror = self.registry.mirror(sample_add, post=post)
+        with self.assertRaisesRegex(RuntimeError, "post boom"):
+            mirror(1, 2)
 
     def test_both_hooks(self):
         log = []
@@ -432,6 +460,18 @@ class TestBlenderContextManager(unittest.TestCase):
 
         self.assertIs(module.fn, sample_add)
 
+    def test_blender_revert_all_twice(self):
+        g = {"target": sample_add}
+        mirror = self.registry.mirror(sample_add)
+        blender = Blender(self.registry)
+        blender.blend_into_globals(g, "target", mirror)
+
+        blender.revert_all()
+        blender.revert_all()
+
+        self.assertIs(g["target"], sample_add)
+        self.assertEqual(blender.blend_count, 0)
+
     def test_closed_blender_rejects_new_blends(self):
         blender = Blender(self.registry)
         blender.revert_all()
@@ -572,6 +612,18 @@ class TestAdaptiveWrapper(unittest.TestCase):
         with patch.object(sys, "gettrace", return_value=None):
             with patch.object(sys, "getprofile", return_value=lambda *a: None):
                 self.assertEqual(wrapper.mode, AdaptiveWrapper.Mode.LIGHTWEIGHT)
+
+    def test_adaptive_wrapper_mode_cache_invalidation(self):
+        wrapper = AdaptiveWrapper(sample_add, self.registry)
+        first_trace = lambda *a: None  # noqa: E731
+        second_trace = lambda *a: None  # noqa: E731
+
+        with patch.object(sys, "gettrace", side_effect=[first_trace, second_trace]):
+            with patch.object(sys, "getprofile", return_value=None):
+                self.assertEqual(wrapper.mode, AdaptiveWrapper.Mode.TRACE)
+                self.assertIs(wrapper._last_trace, first_trace)
+                self.assertEqual(wrapper.mode, AdaptiveWrapper.Mode.TRACE)
+                self.assertIs(wrapper._last_trace, second_trace)
 
     def test_passthrough_never_calls_hooks(self):
         """In passthrough mode, hooks should be skipped entirely."""

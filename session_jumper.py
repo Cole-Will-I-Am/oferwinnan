@@ -9,6 +9,7 @@ device and thawed on another.
 import gzip
 import hashlib
 import json
+import logging
 import os
 import socket
 import time
@@ -21,6 +22,11 @@ from jump_protocol import (
     JumpConnection, JumpListener, MsgType, ProtocolError,
     client_handshake, CHUNK_SIZE,
 )
+
+
+logger = logging.getLogger(__name__)
+
+MAX_FILE_SIZE = 10 * 1024 * 1024
 
 
 # ── Session Model ────────────────────────────────────────────────────────────
@@ -84,7 +90,10 @@ def capture_session(session_id: str, source_device: str,
     if include_files:
         for fpath in include_files:
             p = Path(fpath)
-            if p.is_file() and p.stat().st_size < 10 * 1024 * 1024:  # < 10 MiB
+            if not p.exists():
+                logger.warning("Skipping missing file: %s", p)
+                continue
+            if p.is_file() and p.stat().st_size < MAX_FILE_SIZE:
                 files[str(p)] = base64.b64encode(p.read_bytes()).decode()
 
     session = JumpSession(
@@ -179,7 +188,9 @@ def receive_session(conn: JumpConnection) -> JumpSession:
         msg_type, raw = conn.recv()
         if msg_type != MsgType.FILE_CHUNK:
             raise ProtocolError(f"Expected FILE_CHUNK, got {msg_type}")
-        sep = raw.index(b"\x00")
+        sep = raw.find(b"\x00")
+        if sep == -1:
+            raise ValueError("Invalid session data: missing separator")
         chunk_data = raw[sep + 1:]
         buf.extend(chunk_data)
 

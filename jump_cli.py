@@ -11,32 +11,33 @@ Usage:
 
 import argparse
 import json
+import logging
 import os
-import signal
 import socket
 import sys
 import time
-import uuid
 
 from device_discovery import Device, Transport, DiscoveryManager
 from session_jumper import (
-    JumpNode, JumpSession, capture_session, restore_session, JumpError,
+    JumpNode, JumpSession, restore_session, JumpError,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def cmd_listen(args):
     """Start a jump listener, waiting for incoming sessions."""
     def on_session(session: JumpSession):
-        print(f"\n[RECEIVED] Session '{session.session_id}' from {session.source_device}")
-        print(f"  Timestamp: {time.ctime(session.timestamp)}")
-        print(f"  Source CWD: {session.cwd}")
-        print(f"  Files: {len(session.files)}")
-        print(f"  Metadata: {json.dumps(session.metadata, indent=2)}")
+        logger.info(f"\n[RECEIVED] Session '{session.session_id}' from {session.source_device}")
+        logger.info(f"  Timestamp: {time.ctime(session.timestamp)}")
+        logger.info(f"  Source CWD: {session.cwd}")
+        logger.info(f"  Files: {len(session.files)}")
+        logger.info(f"  Metadata: {json.dumps(session.metadata, indent=2)}")
         if session.files:
             restore = input("  Restore files to current directory? [y/N] ").strip().lower()
             if restore == "y":
                 restore_session(session, restore_files=True)
-                print("  Files restored.")
+                logger.info("  Files restored.")
 
     node = JumpNode(
         node_name=args.name or socket.gethostname(),
@@ -45,27 +46,26 @@ def cmd_listen(args):
         on_session_received=on_session,
     )
     node.start()
-    print(f"Jump node '{node.node_name}' listening on port {args.port}")
-    print(f"Node ID: {node.discovery.node_id}")
+    logger.info(f"Jump node '{node.node_name}' listening on port {args.port}")
+    logger.info(f"Node ID: {node.discovery.node_id}")
     if args.token:
-        print("Authentication: enabled")
-    print("Waiting for incoming jumps... (Ctrl+C to stop)\n")
+        logger.info("Authentication: enabled")
+    logger.info("Waiting for incoming jumps... (Ctrl+C to stop)\n")
 
     try:
         while True:
             devices = node.discover_targets()
             if devices:
-                print(f"\r[{time.strftime('%H:%M:%S')}] "
-                      f"Nearby devices: {len(devices)}", end="", flush=True)
+                logger.info(f"[{time.strftime('%H:%M:%S')}] Nearby devices: {len(devices)}")
             time.sleep(5)
     except KeyboardInterrupt:
-        print("\nShutting down...")
+        logger.info("\nShutting down...")
         node.stop()
 
 
 def cmd_discover(args):
     """Scan for nearby devices on WiFi and Bluetooth."""
-    print("Scanning for nearby devices...")
+    logger.info("Scanning for nearby devices...")
     dm = DiscoveryManager(listen_port=args.port)
     dm.start()
 
@@ -77,18 +77,15 @@ def cmd_discover(args):
             for dev in devices:
                 if dev.device_id not in seen:
                     seen.add(dev.device_id)
-                    print(f"  [{dev.transport.value.upper():9s}] "
-                          f"{dev.name:20s}  {dev.address}:{dev.port}  "
-                          f"caps={dev.capabilities}")
+                    logger.info(f"  [{dev.transport.value.upper():9s}] {dev.name:20s}  {dev.address}:{dev.port}  caps={dev.capabilities}")
             remaining = int(deadline - time.time())
-            print(f"\r  Scanning... {remaining}s remaining, "
-                  f"{len(seen)} device(s) found", end="", flush=True)
+            logger.info(f"  Scanning... {remaining}s remaining, {len(seen)} device(s) found")
             time.sleep(1)
     except KeyboardInterrupt:
         pass
 
     dm.stop()
-    print(f"\n\nDiscovery complete. Found {len(seen)} device(s).")
+    logger.info(f"\n\nDiscovery complete. Found {len(seen)} device(s).")
     return list(seen)
 
 
@@ -99,18 +96,18 @@ def cmd_jump(args):
         auth_token=args.token,
     )
     node.start()
-    print(f"Resolving target '{args.target}'...")
+    logger.info(f"Resolving target '{args.target}'...")
 
     # Allow target to be an IP:port or a discovered device name
     target = _resolve_target(args.target, node, timeout=5)
     if not target:
-        print(f"Error: Could not find device '{args.target}'")
-        print("Tip: Use 'jump_cli.py discover' to find nearby devices,")
-        print("     or specify an IP:PORT directly (e.g. 192.168.1.50:47701)")
+        logger.error(f"Error: Could not find device '{args.target}'")
+        logger.info("Tip: Use 'jump_cli.py discover' to find nearby devices,")
+        logger.info("     or specify an IP:PORT directly (e.g. 192.168.1.50:47701)")
         node.stop()
         sys.exit(1)
 
-    print(f"Jumping to {target.name} ({target.address}:{target.port})...")
+    logger.info(f"Jumping to {target.name} ({target.address}:{target.port})...")
 
     files = args.files or []
     metadata = {"jump_reason": args.reason} if args.reason else {}
@@ -123,11 +120,11 @@ def cmd_jump(args):
             extra_metadata=metadata,
         )
         if success:
-            print("Jump successful! Session transferred.")
+            logger.info("Jump successful! Session transferred.")
         else:
-            print("Jump completed but receiver reported an issue.")
+            logger.warning("Jump completed but receiver reported an issue.")
     except JumpError as e:
-        print(f"Jump failed: {e}")
+        logger.error(f"Jump failed: {e}")
         sys.exit(1)
     finally:
         node.stop()
@@ -135,10 +132,11 @@ def cmd_jump(args):
 
 def cmd_status(args):
     """Show the status of this node."""
-    print(f"Hostname: {socket.gethostname()}")
-    print(f"Node ID:  {uuid.uuid4().hex[:16]}")
-    print(f"Platform: {sys.platform}")
-    print(f"CWD:      {os.getcwd()}")
+    discovery = DiscoveryManager(node_name=args.name or socket.gethostname(), listen_port=args.port)
+    logger.info(f"Hostname: {socket.gethostname()}")
+    logger.info(f"Node ID:  {discovery.node_id}")
+    logger.info(f"Platform: {sys.platform}")
+    logger.info(f"CWD:      {os.getcwd()}")
 
     # Quick network check
     try:
@@ -146,16 +144,16 @@ def cmd_status(args):
         s.connect(("8.8.8.8", 80))
         local_ip = s.getsockname()[0]
         s.close()
-        print(f"Local IP: {local_ip}")
+        logger.info(f"Local IP: {local_ip}")
     except OSError:
-        print("Local IP: unavailable")
+        logger.warning("Local IP: unavailable")
 
     # Bluetooth check
     try:
         import bluetooth  # noqa: F401
-        print("Bluetooth: available")
+        logger.info("Bluetooth: available")
     except ImportError:
-        print("Bluetooth: not available (install PyBluez for BT support)")
+        logger.info("Bluetooth: not available (install PyBluez for BT support)")
 
 
 def _resolve_target(target_str: str, node: JumpNode,
@@ -190,6 +188,7 @@ def _resolve_target(target_str: str, node: JumpNode,
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = argparse.ArgumentParser(
         prog="jump",
         description="Cross-device session jumping via Bluetooth and WiFi",

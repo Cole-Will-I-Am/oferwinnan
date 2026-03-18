@@ -5,16 +5,20 @@ Discovers nearby devices on the local network (WiFi) and via Bluetooth,
 returning a unified list of reachable jump targets.
 """
 
+import hashlib
+import json
 import socket
 import struct
 import threading
 import time
-import json
-import hashlib
 import uuid
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 from typing import Optional
+
+STALE_TIMEOUT_SECONDS = 30.0
+ANNOUNCE_INTERVAL = 5
+BT_SCAN_DURATION = 4
 
 
 class Transport(Enum):
@@ -46,7 +50,7 @@ class Device:
 
     @property
     def is_stale(self):
-        return (time.time() - self.last_seen) > 30.0
+        return (time.time() - self.last_seen) > STALE_TIMEOUT_SECONDS
 
 
 # ── WiFi Discovery (UDP Broadcast) ──────────────────────────────────────────
@@ -72,7 +76,6 @@ def _parse_announce(data: bytes) -> Optional[dict]:
         return None
     if len(data) < 6:
         return None
-    length = struct.pack("!H", *struct.unpack("!H", data[4:6]))
     length = struct.unpack("!H", data[4:6])[0]
     payload = data[6:6 + length]
     try:
@@ -123,7 +126,7 @@ class WiFiDiscovery:
                 sock.sendto(msg, (MULTICAST_GROUP, DISCOVERY_PORT))
             except OSError:
                 pass
-            time.sleep(5)
+            time.sleep(ANNOUNCE_INTERVAL)
         sock.close()
 
     def _listen_loop(self):
@@ -220,7 +223,7 @@ class BluetoothDiscovery:
             return []
         try:
             import bluetooth
-            nearby = bluetooth.discover_devices(duration=4, lookup_names=True,
+            nearby = bluetooth.discover_devices(duration=BT_SCAN_DURATION, lookup_names=True,
                                                 lookup_class=False, flush_cache=True)
             results = []
             for addr, name in nearby:

@@ -9,13 +9,16 @@ Run it: python3 gut_check.py
 Kill it: Ctrl+C (it'll clean up after itself)
 """
 
+import logging
 import os
+import random
+import shutil
+import signal
 import sys
 import time
-import random
-import signal
-import shutil
 from collections import deque
+
+logger = logging.getLogger(__name__)
 
 # ─── Terminal Control ────────────────────────────────────────────────────────
 # Raw ANSI. No curses. No training wheels.
@@ -390,8 +393,7 @@ class InstrumentedRain:
         # Patch the class method
         import gut_check
         self.blender.blend_into_globals(
-            gut_check.Stream.__dict__.__class__.__bases__[0].__dict__
-            if False else vars(gut_check),
+            vars(gut_check),
             "_instrumented_update", mirror
         )
         # Actually patch on the instances via the run loop — simpler: monkeypatch the class
@@ -476,7 +478,7 @@ class InstrumentedRain:
 
 if __name__ == "__main__":
     if not sys.stdout.isatty():
-        print("gut_check.py demands a real terminal.", file=sys.stderr)
+        logger.error("gut_check.py demands a real terminal.")
         sys.exit(1)
 
     if "--instrumented" in sys.argv:

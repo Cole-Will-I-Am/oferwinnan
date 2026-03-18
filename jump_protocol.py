@@ -27,6 +27,7 @@ from cryptography.hazmat.primitives import serialization
 
 PROTOCOL_VERSION = 1
 HEADER_MAGIC = b"JMP\x01"
+HEADER_SIZE = 14
 MAX_PAYLOAD = 16 * 1024 * 1024  # 16 MiB per frame
 CHUNK_SIZE = 64 * 1024           # 64 KiB transfer chunks
 
@@ -57,12 +58,12 @@ def encode_frame(msg_type: MsgType, payload: bytes, seq: int = 0) -> bytes:
 
 def decode_frame(data: bytes) -> tuple[MsgType, int, bytes]:
     """Decode a protocol frame, returning (msg_type, seq, payload)."""
-    if len(data) < 14 or data[:4] != HEADER_MAGIC:
+    if len(data) < HEADER_SIZE or data[:4] != HEADER_MAGIC:
         raise ProtocolError("Invalid frame header")
-    version, mtype, seq, length = struct.unpack("!BBII", data[4:14])
+    version, mtype, seq, length = struct.unpack("!BBII", data[4:HEADER_SIZE])
     if version != PROTOCOL_VERSION:
         raise ProtocolError(f"Unsupported protocol version {version}")
-    payload = data[14:14 + length]
+    payload = data[HEADER_SIZE:HEADER_SIZE + length]
     if len(payload) != length:
         raise ProtocolError("Truncated payload")
     return MsgType(mtype), seq, payload
@@ -70,10 +71,10 @@ def decode_frame(data: bytes) -> tuple[MsgType, int, bytes]:
 
 def recv_frame(sock: socket.socket) -> tuple[MsgType, int, bytes]:
     """Read exactly one frame from a socket."""
-    header = _recv_exact(sock, 14)
+    header = _recv_exact(sock, HEADER_SIZE)
     if header[:4] != HEADER_MAGIC:
         raise ProtocolError("Invalid frame header")
-    version, mtype, seq, length = struct.unpack("!BBII", header[4:14])
+    version, mtype, seq, length = struct.unpack("!BBII", header[4:HEADER_SIZE])
     if version != PROTOCOL_VERSION:
         raise ProtocolError(f"Unsupported protocol version {version}")
     if length > MAX_PAYLOAD:

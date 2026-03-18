@@ -1,5 +1,6 @@
 """Tests for cross-device jumping system."""
 
+import importlib.util
 import gzip
 import hashlib
 import json
@@ -13,21 +14,33 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
+CRYPTOGRAPHY_AVAILABLE = importlib.util.find_spec("cryptography") is not None
+
 from device_discovery import (
     Device, Transport, DiscoveryManager, WiFiDiscovery, BluetoothDiscovery,
     _build_announce, _parse_announce, MAGIC,
 )
-from jump_protocol import (
+if CRYPTOGRAPHY_AVAILABLE:
+    from jump_protocol import (
     MsgType, encode_frame, decode_frame, ProtocolError,
     generate_keypair, derive_session_keys, SessionKeys,
     JumpConnection, JumpListener,
     client_handshake, server_handshake,
     HEADER_MAGIC, PROTOCOL_VERSION,
 )
-from session_jumper import (
+    from session_jumper import (
     JumpSession, capture_session, restore_session,
     send_session, receive_session, JumpNode,
 )
+
+else:
+    MsgType = encode_frame = decode_frame = ProtocolError = None
+    generate_keypair = derive_session_keys = SessionKeys = None
+    JumpConnection = JumpListener = None
+    client_handshake = server_handshake = None
+    HEADER_MAGIC = PROTOCOL_VERSION = None
+    JumpSession = capture_session = restore_session = None
+    send_session = receive_session = JumpNode = None
 
 
 # ── Device Discovery Tests ───────────────────────────────────────────────────
@@ -55,6 +68,19 @@ class TestDevice(unittest.TestCase):
             last_seen=time.time() - 60,
         )
         self.assertTrue(dev.is_stale)
+
+    def test_device_to_dict_bluetooth(self):
+        dev = Device(
+            device_id="bt1",
+            name="Earbuds",
+            address="AA:BB:CC:DD:EE:FF",
+            transport=Transport.BLUETOOTH,
+            last_seen=1234.5,
+            capabilities=["jump"],
+        )
+        restored = Device.from_dict(dev.to_dict())
+        self.assertEqual(restored.transport, Transport.BLUETOOTH)
+        self.assertEqual(restored.address, dev.address)
 
     def test_device_to_dict_roundtrip(self):
         dev = Device(
@@ -119,9 +145,15 @@ class TestDiscoveryManager(unittest.TestCase):
         self.assertIsNotNone(dm.node_id)
         self.assertEqual(len(dm.node_id), 16)
 
+    def test_discovery_manager_node_id_stable(self):
+        dm = DiscoveryManager(node_name="stable", listen_port=47701)
+        self.assertEqual(dm.node_id, dm.node_id)
+        self.assertEqual(len(dm.node_id), 16)
+
 
 # ── Protocol Tests ───────────────────────────────────────────────────────────
 
+@unittest.skipUnless(CRYPTOGRAPHY_AVAILABLE, "cryptography not installed")
 class TestFrameEncoding(unittest.TestCase):
     def test_encode_decode_roundtrip(self):
         payload = b"hello world"
@@ -157,6 +189,7 @@ class TestFrameEncoding(unittest.TestCase):
             decode_frame(frame)
 
 
+@unittest.skipUnless(CRYPTOGRAPHY_AVAILABLE, "cryptography not installed")
 class TestKeyExchange(unittest.TestCase):
     def test_keypair_generation(self):
         priv, pub = generate_keypair()
@@ -199,6 +232,7 @@ class TestKeyExchange(unittest.TestCase):
 
 # ── Handshake Integration Test (loopback) ────────────────────────────────────
 
+@unittest.skipUnless(CRYPTOGRAPHY_AVAILABLE, "cryptography not installed")
 class TestHandshake(unittest.TestCase):
     def test_full_handshake(self):
         """Test client ↔ server handshake over a real socket pair."""
@@ -277,6 +311,7 @@ class TestHandshake(unittest.TestCase):
 
 # ── Session Tests ────────────────────────────────────────────────────────────
 
+@unittest.skipUnless(CRYPTOGRAPHY_AVAILABLE, "cryptography not installed")
 class TestJumpSession(unittest.TestCase):
     def test_serialize_deserialize(self):
         session = JumpSession(
@@ -327,6 +362,7 @@ class TestJumpSession(unittest.TestCase):
         self.assertLess(len(data), len(raw))
 
 
+@unittest.skipUnless(CRYPTOGRAPHY_AVAILABLE, "cryptography not installed")
 class TestCaptureRestore(unittest.TestCase):
     def test_capture_session(self):
         session = capture_session("cap-1", "dev-1")
@@ -334,6 +370,10 @@ class TestCaptureRestore(unittest.TestCase):
         self.assertEqual(session.cwd, os.getcwd())
         self.assertIn("HOME", session.env)
         self.assertTrue(session.validate())
+
+    def test_capture_nonexistent_file(self):
+        session = capture_session("cap-missing", "dev-2", include_files=["/definitely/missing.txt"])
+        self.assertEqual(session.files, {})
 
     def test_capture_with_files(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".txt",
@@ -373,6 +413,19 @@ class TestCaptureRestore(unittest.TestCase):
 
 # ── End-to-end Session Transfer Test ─────────────────────────────────────────
 
+@unittest.skipUnless(CRYPTOGRAPHY_AVAILABLE, "cryptography not installed")
+class TestReceiveSessionValidation(unittest.TestCase):
+    def test_session_missing_separator(self):
+        conn = MagicMock()
+        meta = {"meta": {"size": 4, "checksum": None}}
+        conn.recv_json.return_value = (MsgType.SESSION_DATA, meta)
+        conn.recv.return_value = (MsgType.FILE_CHUNK, b"abcd")
+
+        with self.assertRaisesRegex(ValueError, "missing separator"):
+            receive_session(conn)
+
+
+@unittest.skipUnless(CRYPTOGRAPHY_AVAILABLE, "cryptography not installed")
 class TestSessionTransfer(unittest.TestCase):
     def test_send_receive_session(self):
         """Full end-to-end: handshake + send session + receive session."""

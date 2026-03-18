@@ -48,6 +48,9 @@ __all__ = [
     "RevertError",
 ]
 
+_DUNDER_MIRROR = frozenset({"__init__", "__call__", "__new__"})
+
+
 # ─── Exceptions ──────────────────────────────────────────────────────────────
 
 class MirrorError(Exception):
@@ -297,9 +300,6 @@ class MirrorRegistry:
         # Respect the original metaclass
         metaclass = type(cls)
         cls_name = name or cls.__name__
-
-        # Pre-compute the set of dunder methods to mirror for O(1) lookups
-        _DUNDER_MIRROR = {"__init__", "__call__", "__new__"}
 
         # Build new namespace from the original, mirroring callable members
         namespace: Dict[str, Any] = {}
