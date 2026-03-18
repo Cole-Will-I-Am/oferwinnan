@@ -81,12 +81,23 @@ F = TypeVar("F", bound=Callable[..., Any])
 # ─── Cache Key ───────────────────────────────────────────────────────────────
 # id(obj) is reusable after GC. We combine id + qualname + a generation
 # counter, and use weak references to auto-evict dead entries.
+#
+# Optimization: Use a plain tuple instead of a frozen dataclass.
+# Tuples are natively hashable and avoid the overhead of dataclass
+# __init__, __hash__, and __eq__ slot dispatch.
 
+# Keep the dataclass for backward compatibility with any external code
+# that might reference _CacheKey, but use tuples internally.
 @dataclass(frozen=True, slots=True)
 class _CacheKey:
     obj_id: int
     qualname: str
     generation: int
+
+
+def _make_cache_key(obj_id: int, qualname: str, generation: int) -> tuple:
+    """Create a lightweight cache key as a plain tuple for fast hashing."""
+    return (obj_id, qualname, generation)
 
 
 # ─── MirrorRegistry ─────────────────────────────────────────────────────────
@@ -100,7 +111,7 @@ class MirrorRegistry:
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
-        self._mirrors: Dict[_CacheKey, Any] = {}
+        self._mirrors: Dict[tuple, Any] = {}
         self._origins: Dict[int, Any] = {}  # mirror_id -> original
         self._generation: int = 0
         self._weak_refs: Dict[int, weakref.ref] = {}  # obj_id -> weakref
@@ -131,8 +142,9 @@ class MirrorRegistry:
         with self._lock:
             key = self._make_key(obj, name)
 
-            if key in self._mirrors:
-                return self._mirrors[key]
+            cached = self._mirrors.get(key)
+            if cached is not None:
+                return cached
 
             if isinstance(obj, type):
                 mirrored = self._mirror_class(obj, pre=pre, post=post, name=name)
@@ -153,9 +165,10 @@ class MirrorRegistry:
         """Retrieve the original object from a mirror. Raises if not found."""
         with self._lock:
             mid = id(mirrored)
-            if mid not in self._origins:
+            orig = self._origins.get(mid)
+            if orig is None:
                 raise MirrorError("Object is not a registered mirror")
-            return self._origins[mid]
+            return orig
 
     def is_mirrored(self, obj: Any) -> bool:
         """Check whether `obj` is a mirror created by this registry."""
@@ -177,7 +190,7 @@ class MirrorRegistry:
 
     # ── Cache Key Construction ────────────────────────────────────────────
 
-    def _make_key(self, obj: Any, name: Optional[str]) -> _CacheKey:
+    def _make_key(self, obj: Any, name: Optional[str]) -> tuple:
         obj_id = id(obj)
         qualname = name or getattr(obj, "__qualname__", None) or repr(obj)
 
@@ -189,21 +202,24 @@ class MirrorRegistry:
             except TypeError:
                 pass  # Not weak-referenceable (e.g. built-in)
 
-        return _CacheKey(obj_id, qualname, self._generation)
+        return _make_cache_key(obj_id, qualname, self._generation)
 
     def _on_gc(self, ref: weakref.ref) -> None:
         """Weak-ref callback: bump generation so stale ids aren't reused."""
         with self._lock:
             self._generation += 1
             # Evict dead entries — they'll never match again anyway
-            dead = [k for k, v in self._mirrors.items()
-                    if k.generation < self._generation]
+            gen = self._generation
+            dead = [k for k in self._mirrors if k[2] < gen]
             for k in dead:
                 mirror = self._mirrors.pop(k, None)
                 if mirror is not None:
                     self._origins.pop(id(mirror), None)
 
     # ── Function Mirroring ────────────────────────────────────────────────
+    # Optimization: Local variable binding for pre/post avoids repeated
+    # closure cell lookups. The 'is not None' checks are hoisted to
+    # generate specialized wrappers — no branching in the hot path.
 
     def _mirror_function(
         self,
@@ -213,23 +229,37 @@ class MirrorRegistry:
         post: HookFn,
         name: Optional[str],
     ) -> Callable:
-        @functools.wraps(fn)
-        def instrumented(*args: Any, **kwargs: Any) -> Any:
-            call_args, call_kwargs = args, kwargs
-
-            if pre is not None:
-                override = pre(fn, call_args, call_kwargs)
+        # Generate specialized wrappers to eliminate per-call branching
+        if pre is not None and post is not None:
+            @functools.wraps(fn)
+            def instrumented(*args: Any, **kwargs: Any) -> Any:
+                override = pre(fn, args, kwargs)
                 if override is not None:
-                    call_args, call_kwargs = override
-
-            result = fn(*call_args, **call_kwargs)
-
-            if post is not None:
+                    args, kwargs = override
+                result = fn(*args, **kwargs)
                 replacement = post(fn, result)
                 if replacement is not None:
                     result = replacement
-
-            return result
+                return result
+        elif pre is not None:
+            @functools.wraps(fn)
+            def instrumented(*args: Any, **kwargs: Any) -> Any:
+                override = pre(fn, args, kwargs)
+                if override is not None:
+                    args, kwargs = override
+                return fn(*args, **kwargs)
+        elif post is not None:
+            @functools.wraps(fn)
+            def instrumented(*args: Any, **kwargs: Any) -> Any:
+                result = fn(*args, **kwargs)
+                replacement = post(fn, result)
+                if replacement is not None:
+                    result = replacement
+                return result
+        else:
+            @functools.wraps(fn)
+            def instrumented(*args: Any, **kwargs: Any) -> Any:
+                return fn(*args, **kwargs)
 
         instrumented.__mirror_origin__ = fn
         instrumented.__mirror_registry__ = weakref.ref(self)
@@ -268,12 +298,15 @@ class MirrorRegistry:
         metaclass = type(cls)
         cls_name = name or cls.__name__
 
+        # Pre-compute the set of dunder methods to mirror for O(1) lookups
+        _DUNDER_MIRROR = {"__init__", "__call__", "__new__"}
+
         # Build new namespace from the original, mirroring callable members
         namespace: Dict[str, Any] = {}
         for attr_name, attr_value in cls.__dict__.items():
             if attr_name.startswith("__") and attr_name.endswith("__"):
-                # Preserve dunders as-is (except __init__ and __call__)
-                if attr_name in ("__init__", "__call__", "__new__"):
+                # Preserve dunders as-is (except __init__, __call__, __new__)
+                if attr_name in _DUNDER_MIRROR:
                     if callable(attr_value):
                         namespace[attr_name] = self._mirror_function(
                             attr_value, pre=pre, post=post, name=f"{cls_name}.{attr_name}"
@@ -512,7 +545,8 @@ class Blender:
     # ── Internal ──────────────────────────────────────────────────────────
 
     def _revert_slot(self, key: str, slot: _BlendSlot) -> None:
-        if slot.kind == "module" or slot.kind == "builtins":
+        kind = slot.kind
+        if kind == "module" or kind == "builtins":
             if slot.had_original:
                 setattr(slot.target, slot.attr_name, slot.original)
             else:
@@ -520,7 +554,7 @@ class Blender:
                     delattr(slot.target, slot.attr_name)
                 except AttributeError:
                     pass  # Already gone
-        elif slot.kind == "globals":
+        elif kind == "globals":
             if slot.had_original:
                 slot.target[slot.attr_name] = slot.original
             else:
@@ -532,6 +566,9 @@ class Blender:
 
 
 # ─── AdaptiveWrapper ─────────────────────────────────────────────────────────
+# Optimization: Reduced lock contention by using a simple boolean flag
+# instead of acquiring a lock on every call. The mode is cached and only
+# recomputed when the tracing/profiling state changes.
 
 class AdaptiveWrapper:
     """A smart callable proxy that adapts its behavior to the runtime environment.
@@ -552,6 +589,8 @@ class AdaptiveWrapper:
         "_name",
         "_adapt_cache",
         "_adapt_lock",
+        "_last_trace",
+        "_last_profile",
     )
 
     class Mode:
@@ -577,6 +616,8 @@ class AdaptiveWrapper:
         self._name = name or getattr(target, "__name__", repr(target))
         self._adapt_cache: Optional[str] = None
         self._adapt_lock = threading.Lock()
+        self._last_trace = None
+        self._last_profile = None
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         mode = self._adapt()
@@ -614,25 +655,37 @@ class AdaptiveWrapper:
     def _adapt(self) -> str:
         """Detect the runtime environment and choose instrumentation mode.
 
-        Cached per-call-site — re-evaluates when tracing state changes.
+        Uses cached mode when trace/profile state hasn't changed.
         """
-        # Fast path: check cache
+        current_trace = sys.gettrace()
+        current_profile = sys.getprofile() if hasattr(sys, "getprofile") else None
+
+        # Fast path: if trace/profile state unchanged, return cached mode
+        if (self._adapt_cache is not None
+                and current_trace is self._last_trace
+                and current_profile is self._last_profile):
+            return self._adapt_cache
+
         with self._adapt_lock:
-            current_trace = sys.gettrace()
-            current_profile = sys.getprofile() if hasattr(sys, "getprofile") else None
+            # Double-check after acquiring lock
+            if (self._adapt_cache is not None
+                    and current_trace is self._last_trace
+                    and current_profile is self._last_profile):
+                return self._adapt_cache
 
             if current_trace is not None and current_profile is not None:
-                # Both debugger AND profiler active — minimize overhead
-                return self.Mode.LIGHTWEIGHT
+                mode = self.Mode.LIGHTWEIGHT
             elif current_trace is not None:
-                # Debugger active — provide trace output
-                return self.Mode.TRACE
+                mode = self.Mode.TRACE
             elif current_profile is not None:
-                # Profiler active — skip post-hooks to reduce noise
-                return self.Mode.LIGHTWEIGHT
+                mode = self.Mode.LIGHTWEIGHT
             else:
-                # Normal execution — full instrumentation
-                return self.Mode.FULL
+                mode = self.Mode.FULL
+
+            self._last_trace = current_trace
+            self._last_profile = current_profile
+            self._adapt_cache = mode
+            return mode
 
     def __getattr__(self, name: str) -> Any:
         """Proxy attribute access to the wrapped target."""
