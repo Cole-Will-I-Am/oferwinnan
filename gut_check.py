@@ -229,6 +229,140 @@ class MatrixRain:
         sys.stdout.flush()
 
 
+# ─── Instrumented Mode ───────────────────────────────────────────────────────
+# Demonstrates the mirror_blend framework live on the rain engine.
+# Usage: python3 gut_check.py --instrumented
+
+class InstrumentedRain:
+    """Wraps MatrixRain with live call-counting and timing stats via mirror_blend."""
+
+    def __init__(self):
+        from mirror_blend import MirrorRegistry, Blender, AdaptiveWrapper
+
+        self.registry = MirrorRegistry()
+        self.blender = Blender(self.registry)
+
+        # Counters reset every frame
+        self.glyph_calls = 0
+        self.update_total_us = 0
+        self.update_count = 0
+        self.frame_num = 0
+
+        # Mirror random_glyph with a call counter
+        self._setup_glyph_counter()
+
+        # Mirror Stream.update with a timing hook
+        self._setup_update_timer()
+
+        self.rain = MatrixRain()
+
+    def _setup_glyph_counter(self):
+        def count_glyph(fn, args, kwargs):
+            self.glyph_calls += 1
+
+        mirror = self.registry.mirror(random_glyph, pre=count_glyph, name="random_glyph")
+        # Blend into this module's globals so Stream.render picks it up
+        import gut_check
+        self.blender.blend_into_module(gut_check, "random_glyph", mirror)
+
+    def _setup_update_timer(self):
+        self._update_t0 = 0
+
+        def time_pre(fn, args, kwargs):
+            self._update_t0 = time.monotonic()
+
+        def time_post(fn, result):
+            elapsed_us = (time.monotonic() - self._update_t0) * 1_000_000
+            self.update_total_us += elapsed_us
+            self.update_count += 1
+
+        original_update = Stream.update
+        mirror = self.registry.mirror(original_update, pre=time_pre, post=time_post,
+                                       name="Stream.update")
+        # Patch the class method
+        import gut_check
+        self.blender.blend_into_globals(
+            gut_check.Stream.__dict__.__class__.__bases__[0].__dict__
+            if False else vars(gut_check),
+            "_instrumented_update", mirror
+        )
+        # Actually patch on the instances via the run loop — simpler: monkeypatch the class
+        Stream.update = mirror
+
+    def run(self):
+        original_run = self.rain.run
+        rain = self.rain
+
+        signal.signal(signal.SIGINT, rain._shutdown)
+        signal.signal(signal.SIGTERM, rain._shutdown)
+
+        sys.stdout.write(HIDE_CURSOR + CLEAR)
+        sys.stdout.flush()
+
+        target_fps = 30
+        frame_time = 1.0 / target_fps
+
+        try:
+            while rain.running:
+                t0 = time.monotonic()
+
+                # Reset per-frame counters
+                self.glyph_calls = 0
+                self.update_total_us = 0
+                self.update_count = 0
+                self.frame_num += 1
+
+                rain._handle_resize()
+
+                cur_cells = {}
+                for stream in rain.streams:
+                    stream.update()
+                    stream.render(cur_cells)
+
+                buf = []
+
+                for pos in rain.prev_cells:
+                    if pos not in cur_cells:
+                        buf.append(f"{move(pos[0], pos[1])}{RESET} ")
+
+                for pos, content in cur_cells.items():
+                    buf.append(f"{move(pos[0], pos[1])}{content}")
+
+                buf.append(RESET)
+
+                # Stats bar at the bottom
+                avg_us = (self.update_total_us / max(1, self.update_count))
+                stats = (
+                    f" F:{self.frame_num:>6d}  "
+                    f"glyphs/f:{self.glyph_calls:>4d}  "
+                    f"streams:{self.update_count:>3d}  "
+                    f"avg_update:{avg_us:>6.1f}µs  "
+                    f"mirrors:{self.registry.mirror_count}  "
+                    f"blends:{self.blender.blend_count} "
+                )
+                # Render stats bar: black bg, green text, bottom row
+                bar = (
+                    f"{move(rain.rows, 1)}"
+                    f"{ESC}[48;2;0;0;0m{fg(0, 200, 40)}{bold()}"
+                    f"{stats:<{rain.cols}}"
+                )
+                buf.append(bar)
+
+                sys.stdout.write("".join(buf))
+                sys.stdout.flush()
+
+                rain.prev_cells = cur_cells
+
+                elapsed = time.monotonic() - t0
+                sleep_time = frame_time - elapsed
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+
+        finally:
+            self.blender.revert_all()
+            rain._cleanup()
+
+
 # ─── Entry ───────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -236,5 +370,9 @@ if __name__ == "__main__":
         print("gut_check.py demands a real terminal.", file=sys.stderr)
         sys.exit(1)
 
-    rain = MatrixRain()
-    rain.run()
+    if "--instrumented" in sys.argv:
+        engine = InstrumentedRain()
+        engine.run()
+    else:
+        rain = MatrixRain()
+        rain.run()
