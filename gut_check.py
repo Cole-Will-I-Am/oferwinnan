@@ -27,17 +27,74 @@ CLEAR = f"{ESC}[2J"
 HOME = f"{ESC}[H"
 RESET = f"{ESC}[0m"
 
+# ─── Pre-computed ANSI Escape Code Cache ─────────────────────────────────────
+# Building f-strings every frame is expensive. We pre-compute and store them
+# in flat lookup tables so rendering is just a dict/list lookup.
+
+_BOLD = f"{ESC}[1m"
+_DIM = f"{ESC}[2m"
+
+# Pre-compute move(row, col) strings for a generous terminal size.
+# We'll expand lazily if the terminal is larger.
+_MOVE_CACHE_ROWS = 300
+_MOVE_CACHE_COLS = 500
+_move_cache = {}
+
+def _ensure_move_cache(max_row, max_col):
+    """Expand the move cache to cover at least (max_row, max_col)."""
+    global _MOVE_CACHE_ROWS, _MOVE_CACHE_COLS
+    if max_row <= _MOVE_CACHE_ROWS and max_col <= _MOVE_CACHE_COLS:
+        return
+    _MOVE_CACHE_ROWS = max(max_row, _MOVE_CACHE_ROWS)
+    _MOVE_CACHE_COLS = max(max_col, _MOVE_CACHE_COLS)
+    _move_cache.clear()
+    for r in range(1, _MOVE_CACHE_ROWS + 1):
+        for c in range(1, _MOVE_CACHE_COLS + 1):
+            _move_cache[(r, c)] = f"{ESC}[{r};{c}H"
+
+# Initialize for common terminal sizes
+for _r in range(1, _MOVE_CACHE_ROWS + 1):
+    for _c in range(1, _MOVE_CACHE_COLS + 1):
+        _move_cache[(_r, _c)] = f"{ESC}[{_r};{_c}H"
+del _r, _c
+
+# Pre-compute fg color strings for the specific colors used in rendering.
+# The rain uses a small, fixed palette — cache every color we'll ever need.
+_fg_cache = {}
+
+def _fg_cached(r, g, b):
+    """Return cached fg color string."""
+    key = (r, g, b)
+    cached = _fg_cache.get(key)
+    if cached is not None:
+        return cached
+    s = f"{ESC}[38;2;{r};{g};{b}m"
+    _fg_cache[key] = s
+    return s
+
+# Pre-compute the fixed palette colors used in Stream.render
+_HEAD_COLOR = f"{_BOLD}{_fg_cached(220, 255, 220)}"
+_NEAR_HEAD_COLOR = f"{_BOLD}{_fg_cached(0, 230, 50)}"
+_MID_TRAIL_COLOR = _fg_cached(0, 180, 30)
+
+# Pre-compute dim tail colors for all possible intensity values (30..80)
+_TAIL_COLORS = {}
+for _intensity in range(30, 81):
+    _TAIL_COLORS[_intensity] = f"{_DIM}{_fg_cached(0, _intensity, 0)}"
+del _intensity
+
+# Backward-compatible function signatures (used by InstrumentedRain and tests)
 def move(row, col):
-    return f"{ESC}[{row};{col}H"
+    return _move_cache.get((row, col)) or f"{ESC}[{row};{col}H"
 
 def fg(r, g, b):
-    return f"{ESC}[38;2;{r};{g};{b}m"
+    return _fg_cached(r, g, b)
 
 def bold():
-    return f"{ESC}[1m"
+    return _BOLD
 
 def dim():
-    return f"{ESC}[2m"
+    return _DIM
 
 
 # ─── The Glyphs ─────────────────────────────────────────────────────────────
@@ -52,9 +109,50 @@ GLYPHS = (
     ":・.\"=*+-<>¦╌"
 )
 
+# ─── Batched Randomness ─────────────────────────────────────────────────────
+# Calling random.choice() hundreds of times per frame adds overhead.
+# We pre-generate a large ring buffer of random glyphs and floats,
+# then consume them sequentially — nearly zero per-call cost.
+
+_RANDOM_BATCH_SIZE = 8192
+_glyph_ring = [random.choice(GLYPHS) for _ in range(_RANDOM_BATCH_SIZE)]
+_glyph_ring_idx = 0
+
+_float_ring = [random.random() for _ in range(_RANDOM_BATCH_SIZE)]
+_float_ring_idx = 0
+
+def _refill_glyph_ring():
+    global _glyph_ring
+    _glyph_ring = [random.choice(GLYPHS) for _ in range(_RANDOM_BATCH_SIZE)]
+
+def _refill_float_ring():
+    global _float_ring
+    _float_ring = [random.random() for _ in range(_RANDOM_BATCH_SIZE)]
+
 
 def random_glyph():
-    return random.choice(GLYPHS)
+    global _glyph_ring_idx
+    idx = _glyph_ring_idx
+    g = _glyph_ring[idx]
+    idx += 1
+    if idx >= _RANDOM_BATCH_SIZE:
+        idx = 0
+        _refill_glyph_ring()
+    _glyph_ring_idx = idx
+    return g
+
+
+def _fast_random():
+    """Fast random float from the pre-generated ring buffer."""
+    global _float_ring_idx
+    idx = _float_ring_idx
+    f = _float_ring[idx]
+    idx += 1
+    if idx >= _RANDOM_BATCH_SIZE:
+        idx = 0
+        _refill_float_ring()
+    _float_ring_idx = idx
+    return f
 
 
 # ─── Stream ──────────────────────────────────────────────────────────────────
@@ -116,27 +214,33 @@ class Stream:
         if n == 0:
             return
 
+        col = self.col
+        max_rows = self.max_rows
+        half_n = n >> 1  # n // 2, but faster
+        n_minus_1 = n - 1
+        n_minus_3 = n - 3
+
         for i, (row, glyph) in enumerate(self.trail):
-            if row < 1 or row > self.max_rows:
+            if row < 1 or row > max_rows:
                 continue
 
-            # Mutation: glyphs occasionally flicker
-            if random.random() < 0.03:
+            # Mutation: glyphs occasionally flicker (batched random)
+            if _fast_random() < 0.03:
                 glyph = random_glyph()
 
-            if i == n - 1:
+            if i == n_minus_1:
                 # Head: white-hot
-                cells[(row, self.col)] = f"{bold()}{fg(220, 255, 220)}{glyph}"
-            elif i >= n - 3:
+                cells[(row, col)] = f"{_HEAD_COLOR}{glyph}"
+            elif i >= n_minus_3:
                 # Near-head: bright green
-                cells[(row, self.col)] = f"{bold()}{fg(0, 230, 50)}{glyph}"
-            elif i >= n // 2:
+                cells[(row, col)] = f"{_NEAR_HEAD_COLOR}{glyph}"
+            elif i >= half_n:
                 # Mid-trail: medium green
-                cells[(row, self.col)] = f"{fg(0, 180, 30)}{glyph}"
+                cells[(row, col)] = f"{_MID_TRAIL_COLOR}{glyph}"
             else:
                 # Tail: dim, fading
-                intensity = max(30, int(80 * (i / max(1, n // 2))))
-                cells[(row, self.col)] = f"{dim()}{fg(0, intensity, 0)}{glyph}"
+                intensity = max(30, int(80 * (i / max(1, half_n))))
+                cells[(row, col)] = f"{_TAIL_COLORS[intensity]}{glyph}"
 
 
 # ─── Engine ──────────────────────────────────────────────────────────────────
@@ -155,6 +259,8 @@ class MatrixRain:
         size = shutil.get_terminal_size((80, 24))
         self.cols = size.columns
         self.rows = size.lines
+        # Ensure ANSI move cache covers the terminal
+        _ensure_move_cache(self.rows, self.cols)
 
     def _init_streams(self):
         self.streams = []
@@ -198,13 +304,15 @@ class MatrixRain:
                 buf = []
 
                 # Erase cells that were occupied last frame but aren't now
-                for pos in self.prev_cells:
+                prev = self.prev_cells
+                _mc = _move_cache
+                for pos in prev:
                     if pos not in cur_cells:
-                        buf.append(f"{move(pos[0], pos[1])}{RESET} ")
+                        buf.append(f"{_mc.get(pos) or move(pos[0], pos[1])}{RESET} ")
 
                 # Draw current cells
                 for pos, content in cur_cells.items():
-                    buf.append(f"{move(pos[0], pos[1])}{content}")
+                    buf.append(f"{_mc.get(pos) or move(pos[0], pos[1])}{content}")
 
                 buf.append(RESET)
 
@@ -321,12 +429,13 @@ class InstrumentedRain:
 
                 buf = []
 
+                _mc = _move_cache
                 for pos in rain.prev_cells:
                     if pos not in cur_cells:
-                        buf.append(f"{move(pos[0], pos[1])}{RESET} ")
+                        buf.append(f"{_mc.get(pos) or move(pos[0], pos[1])}{RESET} ")
 
                 for pos, content in cur_cells.items():
-                    buf.append(f"{move(pos[0], pos[1])}{content}")
+                    buf.append(f"{_mc.get(pos) or move(pos[0], pos[1])}{content}")
 
                 buf.append(RESET)
 
@@ -336,14 +445,14 @@ class InstrumentedRain:
                     f" F:{self.frame_num:>6d}  "
                     f"glyphs/f:{self.glyph_calls:>4d}  "
                     f"streams:{self.update_count:>3d}  "
-                    f"avg_update:{avg_us:>6.1f}µs  "
+                    f"avg_update:{avg_us:>6.1f}\u00b5s  "
                     f"mirrors:{self.registry.mirror_count}  "
                     f"blends:{self.blender.blend_count} "
                 )
                 # Render stats bar: black bg, green text, bottom row
                 bar = (
-                    f"{move(rain.rows, 1)}"
-                    f"{ESC}[48;2;0;0;0m{fg(0, 200, 40)}{bold()}"
+                    f"{_mc.get((rain.rows, 1)) or move(rain.rows, 1)}"
+                    f"{ESC}[48;2;0;0;0m{_fg_cached(0, 200, 40)}{_BOLD}"
                     f"{stats:<{rain.cols}}"
                 )
                 buf.append(bar)
