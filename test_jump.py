@@ -378,15 +378,15 @@ class TestCaptureRestore(unittest.TestCase):
         self.assertEqual(session.files, {})
 
     def test_capture_with_files(self):
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt",
-                                         delete=False) as f:
-            f.write("test content")
-            fpath = f.name
-
+        # File must be under CWD to pass the security check
+        fname = "_test_capture_tmp.txt"
+        fpath = os.path.join(os.getcwd(), fname)
         try:
+            with open(fpath, "w") as f:
+                f.write("test content")
             session = capture_session("cap-2", "dev-2",
                                       include_files=[fpath])
-            self.assertIn(fpath, session.files)
+            self.assertIn(fname, session.files)
         finally:
             os.unlink(fpath)
 
@@ -897,6 +897,122 @@ class TestJumpSingleRetry(unittest.TestCase):
         self.assertEqual(result.retries, 1)
         self.assertIsNotNone(result.error)
         self.assertGreater(result.elapsed, 0)
+
+
+@unittest.skipUnless(CRYPTOGRAPHY_AVAILABLE, "cryptography not installed")
+class TestSecurityHardening(unittest.TestCase):
+    """Tests for security hardening of session restore and auth."""
+
+    def test_path_traversal_blocked(self):
+        """restore_session must reject paths with '..' components."""
+        import base64
+        session = JumpSession(
+            session_id="evil",
+            source_device="attacker",
+            files={"../../etc/evil.txt": base64.b64encode(b"pwned").decode()},
+        )
+        session.checksum = session.compute_checksum()
+
+        with tempfile.TemporaryDirectory() as td:
+            restore_session(session, restore_files=True, target_dir=td)
+            # The evil file must NOT have been written outside the target dir
+            self.assertFalse(os.path.exists(os.path.join(td, "..", "..", "etc", "evil.txt")))
+            # Nothing should have been written inside either (path was rejected)
+            self.assertEqual(os.listdir(td), [])
+
+    def test_absolute_path_blocked(self):
+        """restore_session must reject absolute file paths."""
+        import base64
+        session = JumpSession(
+            session_id="evil2",
+            source_device="attacker",
+            files={"/tmp/evil.txt": base64.b64encode(b"pwned").decode()},
+        )
+        session.checksum = session.compute_checksum()
+
+        with tempfile.TemporaryDirectory() as td:
+            restore_session(session, restore_files=True, target_dir=td)
+            self.assertFalse(os.path.exists("/tmp/evil.txt"))
+            self.assertEqual(os.listdir(td), [])
+
+    def test_safe_path_allowed(self):
+        """restore_session should allow clean relative paths."""
+        import base64
+        session = JumpSession(
+            session_id="good",
+            source_device="friend",
+            files={"subdir/hello.txt": base64.b64encode(b"hello").decode()},
+        )
+        session.checksum = session.compute_checksum()
+
+        with tempfile.TemporaryDirectory() as td:
+            restore_session(session, restore_files=True, target_dir=td)
+            written = os.path.join(td, "subdir", "hello.txt")
+            self.assertTrue(os.path.exists(written))
+            self.assertEqual(open(written, "rb").read(), b"hello")
+
+    def test_env_injection_blocked(self):
+        """restore_session must not set dangerous env vars like LD_PRELOAD."""
+        session = JumpSession(
+            session_id="env-evil",
+            source_device="attacker",
+            env={
+                "LD_PRELOAD": "/tmp/evil.so",
+                "PYTHONPATH": "/tmp/evil",
+                "HOME": "/safe/home",
+            },
+        )
+        session.checksum = session.compute_checksum()
+
+        old_ld = os.environ.get("LD_PRELOAD")
+        old_pypath = os.environ.get("PYTHONPATH")
+        try:
+            restore_session(session, restore_env=True)
+            # Dangerous vars must NOT be set
+            self.assertNotEqual(os.environ.get("LD_PRELOAD"), "/tmp/evil.so")
+            self.assertNotEqual(os.environ.get("PYTHONPATH"), "/tmp/evil")
+            # Safe vars should be set
+            self.assertEqual(os.environ.get("HOME"), "/safe/home")
+        finally:
+            # Clean up
+            if old_ld is None:
+                os.environ.pop("LD_PRELOAD", None)
+            else:
+                os.environ["LD_PRELOAD"] = old_ld
+            if old_pypath is None:
+                os.environ.pop("PYTHONPATH", None)
+            else:
+                os.environ["PYTHONPATH"] = old_pypath
+            os.environ.pop("HOME", None)
+
+    def test_timing_safe_auth(self):
+        """JumpNode._validate_auth must use constant-time comparison."""
+        import hmac
+        node = JumpNode(auth_token="secret123", listen_port=0)
+        # Correct token
+        self.assertTrue(node._validate_auth("secret123"))
+        # Wrong token
+        self.assertFalse(node._validate_auth("wrong"))
+        # Empty token
+        self.assertFalse(node._validate_auth(""))
+        node.listener.stop()
+        node.discovery.stop()
+
+    def test_capture_rejects_files_outside_cwd(self):
+        """capture_session should skip files that resolve outside CWD."""
+        with tempfile.TemporaryDirectory() as td:
+            # Create a file outside CWD
+            outside = os.path.join(td, "secret.txt")
+            with open(outside, "w") as f:
+                f.write("secret")
+
+            session = capture_session(
+                "test-capture", "dev1",
+                include_env=False,
+                include_files=[outside],
+            )
+            # File outside CWD should not be included
+            self.assertEqual(len(session.files), 0)
 
 
 if __name__ == "__main__":

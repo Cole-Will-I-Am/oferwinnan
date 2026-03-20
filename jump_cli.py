@@ -268,7 +268,8 @@ def main():
         description="Cross-device session jumping via Bluetooth and WiFi",
     )
     parser.add_argument("--port", type=int, default=47701,
-                        help="Listen/connect port (default: 47701)")
+                        help="Listen/connect port (default: 47701)",
+                        metavar="PORT")
     parser.add_argument("--token", type=str, default=None,
                         help="Authentication token for secure jumps")
     parser.add_argument("--name", type=str, default=None,
@@ -315,6 +316,16 @@ def main():
     p_status = sub.add_parser("status", help="Show node status")
 
     args = parser.parse_args()
+
+    # Validate port range
+    if not (1 <= args.port <= 65535):
+        parser.error(f"Port must be between 1 and 65535, got {args.port}")
+
+    # Clamp discovery timeout if present
+    if hasattr(args, "timeout") and args.timeout is not None:
+        args.timeout = max(1, min(args.timeout, 300))
+    if hasattr(args, "discovery_timeout") and args.discovery_timeout is not None:
+        args.discovery_timeout = max(1, min(args.discovery_timeout, 300))
 
     commands = {
         "listen": cmd_listen,

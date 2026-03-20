@@ -129,12 +129,20 @@ def generate_keypair() -> tuple[x25519.X25519PrivateKey, bytes]:
 
 def derive_session_keys(private_key: x25519.X25519PrivateKey,
                         peer_public_bytes: bytes) -> SessionKeys:
-    """Perform X25519 key agreement and derive a Fernet key."""
+    """Perform X25519 key agreement and derive a Fernet key via HKDF."""
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    from cryptography.hazmat.primitives import hashes
+    import base64
+
     peer_public = x25519.X25519PublicKey.from_public_bytes(peer_public_bytes)
     shared = private_key.exchange(peer_public)
-    # Derive a Fernet-compatible key (URL-safe base64 of 32 bytes)
-    import base64
-    derived = hashlib.sha256(shared).digest()
+    # Use HKDF to derive a proper 32-byte key from the shared secret
+    derived = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=None,
+        info=b"matrix-jump-v1",
+    ).derive(shared)
     fernet_key = base64.urlsafe_b64encode(derived)
     return SessionKeys(
         shared_key=shared,
@@ -269,7 +277,8 @@ class JumpListener:
 
     def __init__(self, host: str = "0.0.0.0", port: int = 47701,
                  auth_validator: Callable[[str], bool] = None,
-                 on_connection: Callable[[JumpConnection], None] = None):
+                 on_connection: Callable[[JumpConnection], None] = None,
+                 max_connections: int = 64):
         self.host = host
         self.port = port
         self.auth_validator = auth_validator
@@ -277,6 +286,7 @@ class JumpListener:
         self._server_sock: Optional[socket.socket] = None
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        self._conn_semaphore = threading.Semaphore(max_connections)
 
     def start(self):
         self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -303,13 +313,32 @@ class JumpListener:
                 continue
             except OSError:
                 break
-            try:
-                conn = server_handshake(client_sock, self.auth_validator)
-                if self.on_connection:
-                    threading.Thread(target=self.on_connection, args=(conn,),
-                                     daemon=True).start()
-            except (ProtocolError, ConnectionError, OSError):
+            # Enforce connection limit
+            if not self._conn_semaphore.acquire(blocking=False):
                 try:
                     client_sock.close()
                 except OSError:
                     pass
+                continue
+            try:
+                conn = server_handshake(client_sock, self.auth_validator)
+                if self.on_connection:
+                    threading.Thread(
+                        target=self._guarded_handler,
+                        args=(conn,), daemon=True,
+                    ).start()
+                else:
+                    self._conn_semaphore.release()
+            except (ProtocolError, ConnectionError, OSError):
+                self._conn_semaphore.release()
+                try:
+                    client_sock.close()
+                except OSError:
+                    pass
+
+    def _guarded_handler(self, conn: JumpConnection):
+        """Wrap on_connection to ensure the semaphore is always released."""
+        try:
+            self.on_connection(conn)
+        finally:
+            self._conn_semaphore.release()

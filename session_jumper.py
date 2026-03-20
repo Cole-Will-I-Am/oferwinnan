@@ -8,6 +8,7 @@ device and thawed on another.
 
 import gzip
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -91,13 +92,25 @@ def capture_session(session_id: str, source_device: str,
 
     files = {}
     if include_files:
+        cwd = Path.cwd().resolve()
         for fpath in include_files:
-            p = Path(fpath)
+            p = Path(fpath).resolve()
             if not p.exists():
-                logger.warning("Skipping missing file: %s", p)
+                logger.warning("Skipping missing file: %s", fpath)
                 continue
-            if p.is_file() and p.stat().st_size < MAX_FILE_SIZE:
-                files[str(p)] = base64.b64encode(p.read_bytes()).decode()
+            if not p.is_file():
+                logger.warning("Skipping non-file: %s", fpath)
+                continue
+            if p.stat().st_size >= MAX_FILE_SIZE:
+                logger.warning("Skipping oversized file: %s", fpath)
+                continue
+            # Store as a relative path; reject files that resolve outside cwd
+            try:
+                rel = p.relative_to(cwd)
+            except ValueError:
+                logger.warning("Skipping file outside working directory: %s", fpath)
+                continue
+            files[str(rel)] = base64.b64encode(p.read_bytes()).decode()
 
     session = JumpSession(
         session_id=session_id,
@@ -112,6 +125,17 @@ def capture_session(session_id: str, source_device: str,
     return session
 
 
+_SAFE_ENV_PREFIXES = ("HOME", "USER", "SHELL", "LANG", "TERM", "PATH",
+                      "PWD", "EDITOR", "VISUAL", "DISPLAY")
+
+_DANGEROUS_ENV_KEYS = frozenset({
+    "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES",
+    "PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME",
+    "NODE_OPTIONS", "PERL5LIB", "RUBYLIB",
+    "CLASSPATH", "JAVA_TOOL_OPTIONS",
+})
+
+
 def restore_session(session: JumpSession, restore_env: bool = False,
                     restore_files: bool = False, target_dir: str = None):
     """Apply a received session on this device."""
@@ -122,12 +146,27 @@ def restore_session(session: JumpSession, restore_env: bool = False,
 
     if restore_env:
         for k, v in session.env.items():
+            # Only restore env vars that match the safe capture allowlist
+            if k in _DANGEROUS_ENV_KEYS:
+                logger.warning("Blocked dangerous env var: %s", k)
+                continue
+            if not any(k.startswith(p) for p in _SAFE_ENV_PREFIXES):
+                logger.warning("Skipping non-allowlisted env var: %s", k)
+                continue
             os.environ[k] = v
 
     if restore_files and session.files:
-        base = Path(target_dir) if target_dir else Path.cwd()
+        base = (Path(target_dir) if target_dir else Path.cwd()).resolve()
         for rel_path, b64data in session.files.items():
-            dest = base / rel_path
+            # Reject absolute paths and traversal sequences
+            if os.path.isabs(rel_path) or ".." in Path(rel_path).parts:
+                logger.warning("Blocked path traversal attempt: %s", rel_path)
+                continue
+            dest = (base / rel_path).resolve()
+            # Final containment check: dest must be within base
+            if not str(dest).startswith(str(base) + os.sep) and dest != base:
+                logger.warning("Blocked path escape: %s", rel_path)
+                continue
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(base64.b64decode(b64data))
 
@@ -453,14 +492,17 @@ class JumpNode:
             on_connection=self._handle_connection,
         )
         self.received_sessions: list[JumpSession] = []
+        self._sessions_lock = threading.Lock()
 
     def _validate_auth(self, token: str) -> bool:
-        return token == self.auth_token
+        # Constant-time comparison to prevent timing attacks
+        return hmac.compare_digest(token, self.auth_token)
 
     def _handle_connection(self, conn: JumpConnection):
         try:
             session = receive_session(conn)
-            self.received_sessions.append(session)
+            with self._sessions_lock:
+                self.received_sessions.append(session)
             if self.on_session_received:
                 self.on_session_received(session)
         except (ProtocolError, ValueError, ConnectionError):
