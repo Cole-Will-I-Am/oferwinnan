@@ -12,6 +12,7 @@ Layer 4: AutonomousLoop     — The feedback loop that ties it all together
 
 from __future__ import annotations
 
+import ast
 import importlib
 import importlib.util
 import logging
@@ -363,11 +364,58 @@ class HotUpgrader:
         upgrader.rollback()
     """
 
+    # Modules and builtins that upgrade code must not use
+    _BLOCKED_IMPORTS = frozenset({
+        "os", "subprocess", "sys", "shutil", "socket", "ctypes",
+        "signal", "pathlib", "io", "tempfile",
+    })
+    _BLOCKED_CALLS = frozenset({
+        "exec", "eval", "__import__", "compile", "open",
+        "getattr", "setattr", "delattr", "globals", "locals",
+    })
+
     def __init__(self, registry: MirrorRegistry, blender: Blender) -> None:
         self._registry = registry
         self._blender = blender
         self._version_stack: List[_UpgradeRecord] = []
         self._lock = threading.Lock()
+
+    @classmethod
+    def _validate_code(cls, code_bytes: bytes, source_path: str = "<upgrade>") -> None:
+        """Validate upgrade code via AST inspection. Raises ValueError on violations."""
+        try:
+            tree = ast.parse(code_bytes, filename=source_path)
+        except SyntaxError as e:
+            raise ValueError(f"Upgrade code has syntax error: {e}") from e
+
+        for node in ast.walk(tree):
+            # Block dangerous imports
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    root_module = alias.name.split(".")[0]
+                    if root_module in cls._BLOCKED_IMPORTS:
+                        raise ValueError(
+                            f"Upgrade code imports blocked module: {alias.name}"
+                        )
+            elif isinstance(node, ast.ImportFrom):
+                if node.module:
+                    root_module = node.module.split(".")[0]
+                    if root_module in cls._BLOCKED_IMPORTS:
+                        raise ValueError(
+                            f"Upgrade code imports from blocked module: {node.module}"
+                        )
+            # Block dangerous function calls
+            elif isinstance(node, ast.Call):
+                func = node.func
+                name = None
+                if isinstance(func, ast.Name):
+                    name = func.id
+                elif isinstance(func, ast.Attribute):
+                    name = func.attr
+                if name in cls._BLOCKED_CALLS:
+                    raise ValueError(
+                        f"Upgrade code uses blocked call: {name}()"
+                    )
 
     def apply_upgrade(
         self,
@@ -388,6 +436,9 @@ class HotUpgrader:
 
         Returns:
             Version index (for selective rollback).
+
+        Raises:
+            ValueError: If the code fails AST validation (blocked imports/calls).
         """
         if isinstance(source, (str, os.PathLike)):
             source_path = str(source)
@@ -396,6 +447,9 @@ class HotUpgrader:
         else:
             code_bytes = source
             source_path = "<upgrade>"
+
+        # Validate code safety before execution
+        self._validate_code(code_bytes, source_path)
 
         # Load into a sandboxed module
         spec = importlib.util.spec_from_loader("_upgrade_tmp", loader=None)
@@ -672,7 +726,7 @@ class AutonomousLoop:
                 metrics = collector()
                 self.adapter.update_metrics(**metrics)
             except Exception:
-                logger.debug("AutonomousLoop: metrics collector failed", exc_info=True)
+                logger.warning("AutonomousLoop: metrics collector failed", exc_info=True)
 
         # Phase 2: Adapt
         self.adapter.adapt()
@@ -686,15 +740,25 @@ class AutonomousLoop:
             try:
                 cb(self)
             except Exception:
-                logger.debug("AutonomousLoop: tick callback failed", exc_info=True)
+                logger.warning("AutonomousLoop: tick callback failed", exc_info=True)
 
     def _check_for_upgrades(self) -> None:
         """Process any sessions received by the JumpNode that contain code."""
         if not hasattr(self.node, "received_sessions"):
             return
 
-        while self.node.received_sessions:
-            session = self.node.received_sessions.pop(0)
+        # Drain sessions thread-safely if the node has a lock
+        lock = getattr(self.node, "_sessions_lock", None)
+        if lock:
+            with lock:
+                pending = list(self.node.received_sessions)
+                self.node.received_sessions.clear()
+        else:
+            pending = []
+            while self.node.received_sessions:
+                pending.append(self.node.received_sessions.pop(0))
+
+        for session in pending:
             py_files = [f for f in session.files if f.endswith(".py")]
             if not py_files:
                 continue

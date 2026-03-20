@@ -237,7 +237,7 @@ class BluetoothDiscovery:
                     capabilities=["jump"],
                 ))
             return results
-        except Exception:
+        except (OSError, ImportError, RuntimeError):
             return []
 
 

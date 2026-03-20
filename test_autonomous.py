@@ -378,5 +378,91 @@ class TestThreadSafety(unittest.TestCase):
         blender.revert_all()
 
 
+class TestHotUpgraderValidation(unittest.TestCase):
+    """Tests for AST-based code validation in HotUpgrader."""
+
+    def setUp(self):
+        self.registry = MirrorRegistry()
+        self.blender = Blender(self.registry)
+        self.upgrader = HotUpgrader(self.registry, self.blender)
+        self.target = types.ModuleType("_test_target")
+        self.target.greet = lambda: "hello"
+
+    def tearDown(self):
+        self.blender.revert_all()
+
+    def test_clean_code_accepted(self):
+        """Valid upgrade code should be accepted and applied."""
+        code = b"def greet(): return 'upgraded'"
+        version = self.upgrader.apply_upgrade(code, self.target, tag="clean")
+        self.assertEqual(version, 0)
+        self.assertEqual(self.target.greet(), "upgraded")
+
+    def test_import_os_rejected(self):
+        """Code importing os must be rejected."""
+        code = b"import os\ndef greet(): return os.getcwd()"
+        with self.assertRaises(ValueError) as ctx:
+            self.upgrader.apply_upgrade(code, self.target)
+        self.assertIn("blocked module", str(ctx.exception))
+
+    def test_import_subprocess_rejected(self):
+        """Code importing subprocess must be rejected."""
+        code = b"import subprocess\ndef greet(): return 'hi'"
+        with self.assertRaises(ValueError) as ctx:
+            self.upgrader.apply_upgrade(code, self.target)
+        self.assertIn("blocked module", str(ctx.exception))
+
+    def test_from_os_import_rejected(self):
+        """Code using 'from os import ...' must be rejected."""
+        code = b"from os.path import join\ndef greet(): return join('a','b')"
+        with self.assertRaises(ValueError) as ctx:
+            self.upgrader.apply_upgrade(code, self.target)
+        self.assertIn("blocked module", str(ctx.exception))
+
+    def test_exec_call_rejected(self):
+        """Code calling exec() must be rejected."""
+        code = b"def greet(): exec('pass')"
+        with self.assertRaises(ValueError) as ctx:
+            self.upgrader.apply_upgrade(code, self.target)
+        self.assertIn("blocked call", str(ctx.exception))
+
+    def test_eval_call_rejected(self):
+        """Code calling eval() must be rejected."""
+        code = b"def greet(): return eval('1+1')"
+        with self.assertRaises(ValueError) as ctx:
+            self.upgrader.apply_upgrade(code, self.target)
+        self.assertIn("blocked call", str(ctx.exception))
+
+    def test_open_call_rejected(self):
+        """Code calling open() must be rejected."""
+        code = b"def greet(): return open('/etc/passwd').read()"
+        with self.assertRaises(ValueError) as ctx:
+            self.upgrader.apply_upgrade(code, self.target)
+        self.assertIn("blocked call", str(ctx.exception))
+
+    def test_dunder_import_rejected(self):
+        """Code calling __import__() must be rejected."""
+        code = b"def greet(): return __import__('os').getcwd()"
+        with self.assertRaises(ValueError) as ctx:
+            self.upgrader.apply_upgrade(code, self.target)
+        self.assertIn("blocked call", str(ctx.exception))
+
+    def test_syntax_error_rejected(self):
+        """Code with syntax errors must be rejected."""
+        code = b"def greet( return 'hi'"
+        with self.assertRaises(ValueError) as ctx:
+            self.upgrader.apply_upgrade(code, self.target)
+        self.assertIn("syntax error", str(ctx.exception))
+
+    def test_validate_code_classmethod(self):
+        """_validate_code should be callable directly for testing."""
+        # Clean code should not raise
+        HotUpgrader._validate_code(b"def foo(): return 42")
+
+        # Dangerous code should raise
+        with self.assertRaises(ValueError):
+            HotUpgrader._validate_code(b"import sys")
+
+
 if __name__ == "__main__":
     unittest.main()
