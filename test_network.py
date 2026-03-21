@@ -342,6 +342,27 @@ class TestSessionKeyCache(unittest.TestCase):
         cache.remove("rm-test")
         self.assertIsNone(cache.get("rm-test"))
 
+    def test_get_returns_independent_key_objects(self):
+        priv, pub = generate_keypair()
+        keys = derive_session_keys(priv, pub, connection_id="clone-test")
+        cache = SessionKeyCache(ttl=60.0)
+        cache.store(keys)
+
+        first = cache.get("clone-test")
+        second = cache.get("clone-test")
+
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertIsNot(first, second)
+        self.assertIsNot(first.ratchet, second.ratchet)
+
+        # Advancing one retrieved keyset must not mutate the other.
+        self.assertEqual(first.ratchet.send_ratchet.counter, 0)
+        self.assertEqual(second.ratchet.send_ratchet.counter, 0)
+        first.encrypt(b"independent-state")
+        self.assertEqual(first.ratchet.send_ratchet.counter, 1)
+        self.assertEqual(second.ratchet.send_ratchet.counter, 0)
+
 
 # == WebSocket Transport Tests =================================================
 

@@ -287,6 +287,8 @@ class SessionKeys:
             return self.fernet.encrypt(data)
 
         key, idx = self.ratchet.next_send_key()
+        if idx > 0xFFFFFFFF:
+            raise ProtocolError("Ratchet message index overflow")
         nonce = os.urandom(12)
         aesgcm = AESGCM(key)
         ciphertext = aesgcm.encrypt(nonce, data, None)
@@ -305,6 +307,7 @@ class SessionKeys:
         nonce = token[_RATCHET_INDEX_SIZE:_RATCHET_INDEX_SIZE + 12]
         ciphertext = token[_RATCHET_INDEX_SIZE + 12:]
 
+        key = b""
         try:
             key = self.ratchet.next_recv_key(idx)
         except RatchetError as e:
@@ -314,7 +317,20 @@ class SessionKeys:
         try:
             return aesgcm.decrypt(nonce, ciphertext, None)
         except Exception as e:
+            # Preserve recoverability for the same message index after a failed
+            # authentication attempt (e.g., corruption/tampering in transit).
+            self.ratchet.restore_recv_key(idx, key)
             raise ProtocolError(f"AES-GCM decryption failed: {e}") from e
+
+    def clone(self) -> "SessionKeys":
+        """Create an independent copy suitable for resumption handoff."""
+        return SessionKeys(
+            shared_key=self.shared_key,
+            fernet=self.fernet,
+            peer_public=self.peer_public,
+            connection_id=self.connection_id,
+            ratchet=self.ratchet.clone() if self.ratchet else None,
+        )
 
 
 def generate_keypair() -> tuple[x25519.X25519PrivateKey, bytes]:
@@ -594,7 +610,7 @@ class SessionKeyCache:
             self._evict()
             entry = self._cache.get(connection_id)
             if entry:
-                return entry[0]
+                return entry[0].clone()
             return None
 
     def remove(self, connection_id: str) -> None:

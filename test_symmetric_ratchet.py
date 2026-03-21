@@ -263,6 +263,38 @@ class TestRatchetWithProtocol(unittest.TestCase):
         ct2 = keys_a.encrypt(b"same data")
         self.assertNotEqual(ct1, ct2)
 
+    def test_failed_decrypt_does_not_burn_key(self):
+        from jump_protocol import derive_session_keys, generate_keypair, ProtocolError
+
+        priv_a, pub_a = generate_keypair()
+        priv_b, pub_b = generate_keypair()
+
+        keys_a = derive_session_keys(priv_a, pub_b, is_initiator=True)
+        keys_b = derive_session_keys(priv_b, pub_a, is_initiator=False)
+
+        plaintext = b"tamper retry safety"
+        ct = keys_a.encrypt(plaintext)
+        tampered = bytearray(ct)
+        tampered[-1] ^= 0x01
+
+        with self.assertRaises(ProtocolError):
+            keys_b.decrypt(bytes(tampered))
+
+        # Valid packet for the same index should still decrypt.
+        self.assertEqual(keys_b.decrypt(ct), plaintext)
+
+    def test_encrypt_index_overflow_raises(self):
+        from jump_protocol import derive_session_keys, generate_keypair, ProtocolError
+
+        priv_a, pub_a = generate_keypair()
+        priv_b, pub_b = generate_keypair()
+
+        keys_a = derive_session_keys(priv_a, pub_b, is_initiator=True)
+        keys_a.ratchet.send_ratchet._counter = 0x1_0000_0000
+
+        with self.assertRaises(ProtocolError):
+            keys_a.encrypt(b"overflow")
+
 
 if __name__ == "__main__":
     unittest.main()

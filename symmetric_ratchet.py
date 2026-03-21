@@ -19,8 +19,7 @@ import hashlib
 import hmac
 import os
 import threading
-from dataclasses import dataclass, field
-from typing import Dict, Optional
+from typing import Dict
 
 
 __all__ = [
@@ -56,7 +55,8 @@ class SymmetricRatchet:
     @property
     def counter(self) -> int:
         """Current message index (number of steps taken)."""
-        return self._counter
+        with self._lock:
+            return self._counter
 
     def step(self) -> tuple[bytes, int]:
         """Advance the ratchet. Returns (message_key, message_index).
@@ -87,6 +87,13 @@ class SymmetricRatchet:
         """Current chain key (snapshot). Use with care — exposes secret material."""
         with self._lock:
             return bytes(self._ck)
+
+    def clone(self) -> "SymmetricRatchet":
+        """Create an independent copy preserving chain key and counter."""
+        with self._lock:
+            cloned = SymmetricRatchet(bytes(self._ck))
+            cloned._counter = self._counter
+            return cloned
 
 
 class RatchetPair:
@@ -144,26 +151,24 @@ class RatchetPair:
         with self._skip_lock:
             # Check if this is a previously skipped key
             if message_index in self._skipped_keys:
-                key = self._skipped_keys.pop(message_index)
-                return key
+                return self._skipped_keys.pop(message_index)
 
-        current = self.recv_ratchet.counter
+            current = self.recv_ratchet.counter
 
-        if message_index < current:
-            raise RatchetError(
-                f"Message index {message_index} already consumed "
-                f"(current recv counter: {current})"
-            )
+            if message_index < current:
+                raise RatchetError(
+                    f"Message index {message_index} already consumed "
+                    f"(current recv counter: {current})"
+                )
 
-        skip_count = message_index - current
-        if skip_count > self.MAX_SKIP:
-            raise RatchetError(
-                f"Message index {message_index} is {skip_count} ahead of "
-                f"current ({current}), exceeds MAX_SKIP={self.MAX_SKIP}"
-            )
+            skip_count = message_index - current
+            if skip_count > self.MAX_SKIP:
+                raise RatchetError(
+                    f"Message index {message_index} is {skip_count} ahead of "
+                    f"current ({current}), exceeds MAX_SKIP={self.MAX_SKIP}"
+                )
 
-        # Advance recv ratchet, caching skipped keys
-        with self._skip_lock:
+            # Advance recv ratchet, caching skipped keys.
             for _ in range(skip_count):
                 skipped_key, skipped_idx = self.recv_ratchet.step()
                 self._skipped_keys[skipped_idx] = skipped_key
@@ -171,13 +176,39 @@ class RatchetPair:
                 # Evict oldest if we exceed the window
                 if len(self._skipped_keys) > self.MAX_SKIP:
                     oldest = min(self._skipped_keys)
-                    # Wipe before discarding
                     self._skipped_keys.pop(oldest)
 
-        # Now the recv ratchet counter == message_index; step once more
-        key, idx = self.recv_ratchet.step()
-        assert idx == message_index, f"Ratchet desync: got {idx}, expected {message_index}"
-        return key
+            # Now the recv ratchet counter == message_index; step once more.
+            key, idx = self.recv_ratchet.step()
+            if idx != message_index:
+                raise RatchetError(
+                    f"Ratchet desync: got {idx}, expected {message_index}"
+                )
+            return key
+
+    def restore_recv_key(self, message_index: int, message_key: bytes) -> None:
+        """Restore a consumed receive key if decryption/authentication fails.
+
+        This allows retrying a message with the same index when transport-level
+        corruption or tampering causes an authentication failure.
+        """
+        with self._skip_lock:
+            if message_index in self._skipped_keys:
+                return
+            self._skipped_keys[message_index] = message_key
+            if len(self._skipped_keys) > self.MAX_SKIP:
+                oldest = min(self._skipped_keys)
+                self._skipped_keys.pop(oldest)
+
+    def clone(self) -> "RatchetPair":
+        """Create an independent copy preserving current ratchet state."""
+        cloned = RatchetPair.__new__(RatchetPair)
+        cloned.send_ratchet = self.send_ratchet.clone()
+        with self._skip_lock:
+            cloned.recv_ratchet = self.recv_ratchet.clone()
+            cloned._skipped_keys = dict(self._skipped_keys)
+        cloned._skip_lock = threading.Lock()
+        return cloned
 
     @property
     def skipped_count(self) -> int:
