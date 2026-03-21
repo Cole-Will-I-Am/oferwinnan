@@ -15,33 +15,33 @@ Transfer your working session (environment, files, clipboard) between machines o
                   ┌────────────┼────────────┐
                   ▼            ▼            ▼
           ┌──────────────┐ ┌──────────┐ ┌──────────┐
-          │session_jumper│ │gut_check │ │autonomous│
+          │session_jumper│ │gut_check │ │ director │ Tier 1/2/3
           └──────┬───────┘ └──────────┘ └────┬─────┘
                  │                           │
          ┌───────┼──────────┐          ┌─────┴──────┐
-         ▼       ▼          ▼          ▼            │
-    ┌──────────┐┌────────────┐┌──────────────────┐  │
-    │device_   ││jump_       ││transport_        │  │
-    │discovery ││protocol    ││negotiator        │  │
-    └──────────┘└──────┬─────┘└──────────────────┘  │
-                       │                             │
-                ┌──────┴──────┐              ┌───────┴───────┐
-                ▼             ▼              ▼               │
-         ┌──────────────┐┌─────────┐  ┌────────────┐        │
-         │symmetric_    ││multipath│  │mirror_blend │        │
-         │ratchet       ││         │  └─────────────┘        │
-         └──────────────┘└─────────┘                         │
-                                                             │
-      ── Layer 0 (no internal deps) ─────────────────────────┘
+         ▼       ▼          ▼          ▼            ▼
+    ┌──────────┐┌────────────┐┌──────────────┐┌────────────┐
+    │device_   ││jump_       ││transport_    ││autonomous  │
+    │discovery ││protocol    ││negotiator    │└─────┬──────┘
+    └──────────┘└──────┬─────┘└──────────────┘      │
+                       │                        ┌───┴───────┐
+                ┌──────┴──────┐                 ▼           ▼
+                ▼             ▼          ┌────────────┐┌────────────┐
+         ┌──────────────┐┌─────────┐    │mirror_blend││llm_backend │
+         │symmetric_    ││multipath│    └────────────┘└────────────┘
+         │ratchet       ││         │
+         └──────────────┘└─────────┘
+
+      ── Layer 0 (no internal deps) ─────────────────────────
       rbac, dead_drop, secure_terminate, task_relay,
-      node_manager, transport_ws, data_sync
+      node_manager, transport_ws, data_sync, config
 ```
 
 ### Modules
 
 | Module | Purpose |
 |---|---|
-| `cli.py` | CLI entry point — listen, discover, jump, multiply, status, rain, config |
+| `cli.py` | CLI entry point — listen, discover, jump, multiply, status, rain, config, director |
 | `jump_protocol.py` | Binary framing + X25519 key exchange + ratcheted AES-256-GCM |
 | `symmetric_ratchet.py` | Signal-spec KDF_CK chain ratchet for per-message forward secrecy |
 | `session_jumper.py` | Serialize, transfer, and resume sessions across devices |
@@ -50,7 +50,9 @@ Transfer your working session (environment, files, clipboard) between machines o
 | `transport_negotiator.py` | Auto-selects fastest transport + traffic normalization |
 | `multipath.py` | Split transfers across multiple transports simultaneously |
 | `mirror_blend.py` | Runtime function instrumentation and hot-swap |
-| `autonomous.py` | Self-healing orchestration: fallback chains, hot code upgrades |
+| `autonomous.py` | Self-healing orchestration: fallback chains, hot code upgrades, exhaustion hooks |
+| `director.py` | Tri-State Director: FSM (AUTONOMOUS/AI_ACTIVE/HUMAN_OVERRIDE), EscalationDetector, ToolExecutor, SemanticDelta, audit trail |
+| `llm_backend.py` | Unified LLM interface (Ollama + Anthropic) — zero external deps, single-turn tool-use only |
 | `node_manager.py` | Node health tracking, task queues, campaigns |
 | `task_relay.py` | Hop-based relay routing for segmented networks |
 | `dead_drop.py` | Async transport via cloud storage mailboxes (S3/GCS/filesystem) |
@@ -86,6 +88,20 @@ matrix rain
 
 # Show loaded config
 matrix config
+
+# Start the Tri-State Director (LLM-augmented orchestration)
+matrix director start
+
+# Human override / release
+matrix director override
+matrix director release
+
+# Manual AI escalation
+matrix director escalate --reason "connectivity degraded"
+
+# View director state and audit log
+matrix director status
+matrix director audit
 ```
 
 ## Configuration
@@ -111,6 +127,16 @@ cp .env.example .env
 | `MATRIX_MAX_FILE_SIZE` | `10485760` | Max file size for session capture (bytes) |
 | `MATRIX_AUTH_TOKEN` | | Authentication token for secure jumps |
 | `MATRIX_NODE_NAME` | | Custom node name (default: hostname) |
+| `MATRIX_LLM_BACKEND` | `ollama` | LLM provider: `ollama` or `anthropic` |
+| `MATRIX_LLM_MODEL` | | Model name (required when director is used) |
+| `MATRIX_LLM_ENDPOINT` | `http://127.0.0.1:11434` | Ollama API endpoint |
+| `MATRIX_LLM_API_KEY` | | Anthropic API key (required for `anthropic` backend) |
+| `MATRIX_LLM_TIMEOUT` | `30.0` | LLM request timeout (seconds) |
+| `MATRIX_LLM_ACTION_BUDGET` | `5` | Max tool calls per AI escalation |
+| `MATRIX_ESCALATION_COOLDOWN` | `60.0` | Minimum seconds between escalations |
+| `MATRIX_DEGRADED_SUSTAIN` | `10.0` | Sustained degradation before escalation (seconds) |
+| `MATRIX_TASK_FAILURE_WINDOW` | `120.0` | Task failure rate window (seconds) |
+| `MATRIX_TASK_FAILURE_THRESHOLD` | `5` | Failures in window to trigger escalation |
 
 ## Running as a Service
 
@@ -135,6 +161,20 @@ python -m pytest tests/ -v
 # Run with unittest
 python -m unittest discover -s tests -v
 ```
+
+## Director
+
+The Tri-State Director adds LLM-augmented orchestration with three tiers of authority:
+
+| Tier | State | Description |
+|---|---|---|
+| 3 | `AUTONOMOUS` | Deterministic AutonomousLoop runs (default) |
+| 2 | `AI_ACTIVE` | LLM evaluates and acts through 7 sandboxed tools |
+| 1 | `HUMAN_OVERRIDE` | Human operator in direct control via CLI |
+
+Escalation triggers: fallback exhaustion, all-paths-degraded (sustained), task failure rate, transport total failure, manual. All triggers use hysteresis (cooldown + sustain windows) to prevent flapping.
+
+Safety constraints: action budget (default 5), dead-man's switch timeout, AST quarantine on all proposed code (blocks `os`/`subprocess`/`eval`/`exec`/`open`), rollback on any failure, full audit trail.
 
 ## Security
 
