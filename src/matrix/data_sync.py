@@ -39,7 +39,9 @@ class SyncError(Exception):
 
 # -- Constants -----------------------------------------------------------------
 
-SYNC_CHUNK_SIZE = 64 * 1024  # 64 KiB, matches jump_protocol.CHUNK_SIZE
+from matrix.config import config as _config
+
+SYNC_CHUNK_SIZE = _config.chunk_size  # 64 KiB, matches jump_protocol.CHUNK_SIZE
 
 
 # -- Data Models ---------------------------------------------------------------

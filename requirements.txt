@@ -1,3 +1,0 @@
-cryptography>=41.0.0
-# Optional: websockets for async WebSocket (transport_ws.py uses built-in sync impl)
-# websockets>=12.0

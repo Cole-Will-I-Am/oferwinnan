@@ -22,7 +22,7 @@ from unittest.mock import MagicMock, patch
 CRYPTOGRAPHY_AVAILABLE = importlib.util.find_spec("cryptography") is not None
 
 if CRYPTOGRAPHY_AVAILABLE:
-    from jump_protocol import (
+    from matrix.jump_protocol import (
         TransportBackend, DirectTCPBackend, SessionKeyCache,
         JumpConnection, JumpListener, MsgType, ProtocolError,
         encode_frame, decode_frame,
@@ -32,20 +32,20 @@ if CRYPTOGRAPHY_AVAILABLE:
         HEADER_MAGIC, PROTOCOL_VERSION, PROTOCOL_VERSION_LEGACY,
         _wrap_backend, _key_cache,
     )
-    from session_jumper import (
+    from matrix.session_jumper import (
         JumpSession, TransferState, TransferStateStore,
         send_session, receive_session,
     )
-    from transport_ws import (
+    from matrix.transport_ws import (
         WebSocketBackend, WebSocketListener,
         _ws_write_frame, _ws_read_frame,
         _ws_client_handshake, _ws_server_handshake,
         WS_BINARY, WS_CLOSE, WS_PING, WS_PONG,
     )
-    from multipath import (
+    from matrix.multipath import (
         PathState, PathHealth, MultiPathConnection,
     )
-    from transport_negotiator import (
+    from matrix.transport_negotiator import (
         TransportNegotiator, ProbeResult,
         pad_frame, strip_padding, PADDING_BUCKETS,
         TimingJitter, CoverTrafficGenerator,
@@ -849,8 +849,8 @@ class TestProbe(unittest.TestCase):
         result = neg.negotiate(timeout=1.0)
         self.assertFalse(result.success)
 
-    @patch("transport_negotiator._probe_tcp")
-    @patch("transport_negotiator._probe_https")
+    @patch("matrix.transport_negotiator._probe_tcp")
+    @patch("matrix.transport_negotiator._probe_https")
     def test_negotiate_ignores_stateless_https_when_connectable_exists(
         self, mock_probe_https, mock_probe_tcp
     ):
@@ -869,8 +869,8 @@ class TestProbe(unittest.TestCase):
         self.assertEqual(result.transport, "tcp")
         self.assertIs(result.backend, tcp_backend)
 
-    @patch("transport_negotiator._probe_tcp")
-    @patch("transport_negotiator._probe_https")
+    @patch("matrix.transport_negotiator._probe_tcp")
+    @patch("matrix.transport_negotiator._probe_https")
     def test_negotiate_fails_when_only_stateless_probes_succeed(
         self, mock_probe_https, mock_probe_tcp
     ):

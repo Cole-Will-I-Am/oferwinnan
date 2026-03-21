@@ -16,9 +16,11 @@ from dataclasses import dataclass, field, asdict
 from enum import Enum
 from typing import Optional
 
-STALE_TIMEOUT_SECONDS = 30.0
-ANNOUNCE_INTERVAL = 5
-BT_SCAN_DURATION = 4
+from matrix.config import config
+
+STALE_TIMEOUT_SECONDS = config.stale_timeout
+ANNOUNCE_INTERVAL = config.announce_interval
+BT_SCAN_DURATION = config.bt_scan_duration
 
 
 class Transport(Enum):
@@ -55,8 +57,8 @@ class Device:
 
 # ── WiFi Discovery (UDP Broadcast) ──────────────────────────────────────────
 
-MULTICAST_GROUP = "239.255.77.88"
-DISCOVERY_PORT = 47700
+MULTICAST_GROUP = config.multicast_group
+DISCOVERY_PORT = config.discovery_port
 MAGIC = b"JUMP"
 
 

@@ -7,7 +7,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from task_relay import (
+from matrix.task_relay import (
     RelayEntry,
     RelayMessage,
     RelayTable,

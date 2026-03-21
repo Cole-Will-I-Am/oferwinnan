@@ -17,8 +17,8 @@ import socket
 import sys
 import time
 
-from device_discovery import Device, Transport, DiscoveryManager
-from session_jumper import (
+from matrix.device_discovery import Device, Transport, DiscoveryManager
+from matrix.session_jumper import (
     JumpNode, JumpSession, restore_session, JumpError,
     MultiJumpStrategy, MultiJumpResult, TargetResult,
 )
@@ -264,7 +264,7 @@ def _resolve_target(target_str: str, node: JumpNode,
 def main():
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = argparse.ArgumentParser(
-        prog="jump",
+        prog="matrix",
         description="Cross-device session jumping via Bluetooth and WiFi",
     )
     parser.add_argument("--port", type=int, default=47701,
@@ -315,6 +315,14 @@ def main():
     # status
     p_status = sub.add_parser("status", help="Show node status")
 
+    # rain
+    p_rain = sub.add_parser("rain", help="Matrix digital rain")
+    p_rain.add_argument("--instrumented", action="store_true",
+                        help="Show live mirror_blend stats overlay")
+
+    # config
+    p_config = sub.add_parser("config", help="Show loaded configuration")
+
     args = parser.parse_args()
 
     # Validate port range
@@ -333,8 +341,34 @@ def main():
         "jump": cmd_jump,
         "multiply": cmd_multiply,
         "status": cmd_status,
+        "rain": cmd_rain,
+        "config": cmd_config,
     }
     commands[args.command](args)
+
+
+def cmd_rain(args):
+    """Launch the Matrix digital rain."""
+    if not sys.stdout.isatty():
+        logger.error("rain requires a real terminal.")
+        sys.exit(1)
+    from matrix.gut_check import MatrixRain, InstrumentedRain
+    if args.instrumented:
+        engine = InstrumentedRain()
+    else:
+        engine = MatrixRain()
+    engine.run()
+
+
+def cmd_config(args):
+    """Show the current loaded configuration."""
+    from matrix.config import config
+    from dataclasses import fields
+    for f in fields(config):
+        value = getattr(config, f.name)
+        if f.name == "auth_token" and value:
+            value = value[:4] + "****"
+        logger.info(f"  {f.name:25s} = {value}")
 
 
 if __name__ == "__main__":

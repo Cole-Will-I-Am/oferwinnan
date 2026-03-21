@@ -8,7 +8,7 @@ import time
 import unittest
 from unittest.mock import patch, MagicMock
 
-from dead_drop import (
+from matrix.dead_drop import (
     CloudProvider,
     DeadDropConfig,
     FileSystemDeadDrop,

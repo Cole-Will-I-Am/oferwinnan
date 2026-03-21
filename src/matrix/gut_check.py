@@ -373,7 +373,7 @@ class InstrumentedRain:
 
         mirror = self.registry.mirror(random_glyph, pre=count_glyph, name="random_glyph")
         # Blend into this module's globals so Stream.render picks it up
-        import gut_check
+        import matrix.gut_check as gut_check
         self.blender.blend_into_module(gut_check, "random_glyph", mirror)
 
     def _setup_update_timer(self):
@@ -391,7 +391,7 @@ class InstrumentedRain:
         mirror = self.registry.mirror(original_update, pre=time_pre, post=time_post,
                                        name="Stream.update")
         # Patch the class method
-        import gut_check
+        import matrix.gut_check as gut_check
         self.blender.blend_into_globals(
             vars(gut_check),
             "_instrumented_update", mirror

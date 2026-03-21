@@ -16,19 +16,19 @@ from unittest.mock import patch, MagicMock
 
 CRYPTOGRAPHY_AVAILABLE = importlib.util.find_spec("cryptography") is not None
 
-from device_discovery import (
+from matrix.device_discovery import (
     Device, Transport, DiscoveryManager, WiFiDiscovery, BluetoothDiscovery,
     _build_announce, _parse_announce, MAGIC,
 )
 if CRYPTOGRAPHY_AVAILABLE:
-    from jump_protocol import (
+    from matrix.jump_protocol import (
     MsgType, encode_frame, decode_frame, ProtocolError,
     generate_keypair, derive_session_keys, SessionKeys,
     JumpConnection, JumpListener,
     client_handshake, server_handshake,
     HEADER_MAGIC, PROTOCOL_VERSION,
 )
-    from session_jumper import (
+    from matrix.session_jumper import (
     JumpSession, capture_session, restore_session,
     send_session, receive_session, JumpNode,
     MultiJumpStrategy, MultiJumpResult, TargetResult,

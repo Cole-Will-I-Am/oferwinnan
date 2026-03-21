@@ -6,7 +6,7 @@ import os
 import threading
 import unittest
 
-from symmetric_ratchet import SymmetricRatchet, RatchetPair, RatchetError
+from matrix.symmetric_ratchet import SymmetricRatchet, RatchetPair, RatchetError
 
 
 class TestSymmetricRatchet(unittest.TestCase):
@@ -200,7 +200,7 @@ class TestRatchetWithProtocol(unittest.TestCase):
     """Integration with jump_protocol SessionKeys."""
 
     def test_session_keys_ratcheted_encrypt_decrypt(self):
-        from jump_protocol import derive_session_keys, generate_keypair
+        from matrix.jump_protocol import derive_session_keys, generate_keypair
 
         priv_a, pub_a = generate_keypair()
         priv_b, pub_b = generate_keypair()
@@ -219,7 +219,7 @@ class TestRatchetWithProtocol(unittest.TestCase):
         self.assertEqual(pt, plaintext)
 
     def test_multiple_messages(self):
-        from jump_protocol import derive_session_keys, generate_keypair
+        from matrix.jump_protocol import derive_session_keys, generate_keypair
 
         priv_a, pub_a = generate_keypair()
         priv_b, pub_b = generate_keypair()
@@ -234,7 +234,7 @@ class TestRatchetWithProtocol(unittest.TestCase):
             self.assertEqual(pt, msg)
 
     def test_bidirectional_protocol(self):
-        from jump_protocol import derive_session_keys, generate_keypair
+        from matrix.jump_protocol import derive_session_keys, generate_keypair
 
         priv_a, pub_a = generate_keypair()
         priv_b, pub_b = generate_keypair()
@@ -252,7 +252,7 @@ class TestRatchetWithProtocol(unittest.TestCase):
 
     def test_ciphertext_uniqueness(self):
         """Same plaintext produces different ciphertext each time (unique key + nonce)."""
-        from jump_protocol import derive_session_keys, generate_keypair
+        from matrix.jump_protocol import derive_session_keys, generate_keypair
 
         priv_a, pub_a = generate_keypair()
         priv_b, pub_b = generate_keypair()
@@ -264,7 +264,7 @@ class TestRatchetWithProtocol(unittest.TestCase):
         self.assertNotEqual(ct1, ct2)
 
     def test_failed_decrypt_does_not_burn_key(self):
-        from jump_protocol import derive_session_keys, generate_keypair, ProtocolError
+        from matrix.jump_protocol import derive_session_keys, generate_keypair, ProtocolError
 
         priv_a, pub_a = generate_keypair()
         priv_b, pub_b = generate_keypair()
@@ -284,7 +284,7 @@ class TestRatchetWithProtocol(unittest.TestCase):
         self.assertEqual(keys_b.decrypt(ct), plaintext)
 
     def test_encrypt_index_overflow_raises(self):
-        from jump_protocol import derive_session_keys, generate_keypair, ProtocolError
+        from matrix.jump_protocol import derive_session_keys, generate_keypair, ProtocolError
 
         priv_a, pub_a = generate_keypair()
         priv_b, pub_b = generate_keypair()

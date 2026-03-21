@@ -23,7 +23,7 @@ import types
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-from mirror_blend import MirrorRegistry, Blender, AdaptiveWrapper, BlendError
+from matrix.mirror_blend import MirrorRegistry, Blender, AdaptiveWrapper, BlendError
 
 logger = logging.getLogger(__name__)
 

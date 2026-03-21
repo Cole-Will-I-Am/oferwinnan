@@ -5,8 +5,8 @@ import time
 import types
 import unittest
 
-from mirror_blend import MirrorRegistry, Blender
-from autonomous import (
+from matrix.mirror_blend import MirrorRegistry, Blender
+from matrix.autonomous import (
     ResilienceManager,
     EnvironmentAdapter,
     HotUpgrader,

@@ -24,17 +24,19 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Dict, Optional
 
-from device_discovery import Device, Transport, DiscoveryManager
-from jump_protocol import (
+from matrix.device_discovery import Device, Transport, DiscoveryManager
+from matrix.jump_protocol import (
     JumpConnection, JumpListener, MsgType, ProtocolError,
     TransportBackend, DirectTCPBackend, _wrap_backend,
     client_handshake, CHUNK_SIZE,
 )
 
 
+from matrix.config import config as _config
+
 logger = logging.getLogger(__name__)
 
-MAX_FILE_SIZE = 10 * 1024 * 1024
+MAX_FILE_SIZE = _config.max_file_size
 
 
 # == Session Model =============================================================

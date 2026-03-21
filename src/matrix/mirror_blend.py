@@ -4,7 +4,7 @@ mirror_blend.py — Runtime object instrumentation framework.
 Mirror any callable. Blend it into any namespace. Revert cleanly.
 Thread-safe. No GC heap walks. No frame hacks. No broken abstractions.
 
-    from mirror_blend import MirrorRegistry, Blender, AdaptiveWrapper
+    from matrix.mirror_blend import MirrorRegistry, Blender, AdaptiveWrapper
 
     registry = MirrorRegistry()
     mirror = registry.mirror(some_function, pre=log_call, post=log_return)

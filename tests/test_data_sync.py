@@ -8,7 +8,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from data_sync import (
+from matrix.data_sync import (
     SyncEntry,
     SyncResult,
     SyncManifest,

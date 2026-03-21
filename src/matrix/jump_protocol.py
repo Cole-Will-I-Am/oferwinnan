@@ -29,7 +29,7 @@ from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from symmetric_ratchet import RatchetPair, RatchetError
+from matrix.symmetric_ratchet import RatchetPair, RatchetError
 
 
 # == Protocol Constants ========================================================
@@ -38,8 +38,10 @@ PROTOCOL_VERSION = 2  # Bumped: transport-agnostic framing
 PROTOCOL_VERSION_LEGACY = 1
 HEADER_MAGIC = b"JMP\x01"
 HEADER_SIZE = 14
-MAX_PAYLOAD = 16 * 1024 * 1024  # 16 MiB per frame
-CHUNK_SIZE = 64 * 1024           # 64 KiB transfer chunks
+from matrix.config import config as _config
+
+MAX_PAYLOAD = _config.max_payload     # 16 MiB per frame
+CHUNK_SIZE = _config.chunk_size       # 64 KiB transfer chunks
 
 
 class MsgType(IntEnum):

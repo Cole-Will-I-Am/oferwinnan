@@ -3,12 +3,12 @@ from collections import deque
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import gut_check
+import matrix.gut_check as gut_check
 
 
 class TestStream(unittest.TestCase):
     def test_init_sets_defaults(self):
-        with patch("gut_check.random.randint", side_effect=[-5, 8]), patch("gut_check.random.choice", return_value=2):
+        with patch("matrix.gut_check.random.randint", side_effect=[-5, 8]), patch("matrix.gut_check.random.choice", return_value=2):
             stream = gut_check.Stream(3, 20)
 
         self.assertEqual(stream.col, 3)
@@ -43,7 +43,7 @@ class TestStream(unittest.TestCase):
         self.assertEqual(stream.head, 0)
         self.assertEqual(stream.tick, 1)
 
-        with patch("gut_check.random_glyph", return_value="A"):
+        with patch("matrix.gut_check.random_glyph", return_value="A"):
             stream.update()
 
         self.assertEqual(stream.head, 1)
@@ -59,7 +59,7 @@ class TestStream(unittest.TestCase):
         stream.tick = 0
         stream.trail.append((5, "Z"))
 
-        with patch("gut_check.random.randint", return_value=7):
+        with patch("matrix.gut_check.random.randint", return_value=7):
             stream.update()
 
         self.assertFalse(stream.alive)
@@ -82,7 +82,7 @@ class TestStream(unittest.TestCase):
         stream.trail = deque([(1, "A"), (2, "B"), (3, "C")])
         cells = {}
 
-        with patch("gut_check._fast_random", return_value=1.0):
+        with patch("matrix.gut_check._fast_random", return_value=1.0):
             stream.render(cells)
 
         self.assertEqual(set(cells.keys()), {(1, 4), (2, 4), (3, 4)})
@@ -107,7 +107,7 @@ class TestRandomHelpers(unittest.TestCase):
             self.assertLess(value, 1.0)
 
     def test_ring_buffer_refill(self):
-        with patch("gut_check.random.choice", return_value="Z"):
+        with patch("matrix.gut_check.random.choice", return_value="Z"):
             gut_check._glyph_ring_idx = gut_check._RANDOM_BATCH_SIZE - 5
             values = [gut_check.random_glyph() for _ in range(gut_check._RANDOM_BATCH_SIZE + 10)]
 
@@ -122,7 +122,7 @@ class TestMatrixRain(unittest.TestCase):
 
     def test_detect_size_sets_rows_and_cols(self):
         rain = gut_check.MatrixRain()
-        with patch("gut_check.shutil.get_terminal_size", return_value=SimpleNamespace(columns=120, lines=55)):
+        with patch("matrix.gut_check.shutil.get_terminal_size", return_value=SimpleNamespace(columns=120, lines=55)):
             rain._detect_size()
         self.assertEqual(rain.cols, 120)
         self.assertEqual(rain.rows, 55)
@@ -130,7 +130,7 @@ class TestMatrixRain(unittest.TestCase):
     def test_handle_resize_reinits_streams_when_size_changes(self):
         rain = gut_check.MatrixRain()
         with patch.object(rain, "_init_streams") as init_streams, patch(
-            "gut_check.shutil.get_terminal_size",
+            "matrix.gut_check.shutil.get_terminal_size",
             return_value=SimpleNamespace(columns=rain.cols + 1, lines=rain.rows + 1),
         ):
             rain._handle_resize()

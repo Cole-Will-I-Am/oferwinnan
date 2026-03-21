@@ -6,7 +6,7 @@ import threading
 import time
 import unittest
 
-from secure_terminate import (
+from matrix.secure_terminate import (
     TerminationCommand,
     TerminationAuditEntry,
     SecureTerminator,

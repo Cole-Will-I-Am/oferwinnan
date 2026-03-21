@@ -13,7 +13,7 @@ import unittest
 import warnings
 from unittest.mock import MagicMock, patch
 
-from mirror_blend import (
+from matrix.mirror_blend import (
     MirrorRegistry,
     Blender,
     AdaptiveWrapper,

@@ -25,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
-from jump_protocol import (
+from matrix.jump_protocol import (
     TransportBackend, DirectTCPBackend, JumpConnection,
     MsgType, ProtocolError, SessionKeys,
     client_handshake, server_handshake,

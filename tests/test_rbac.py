@@ -4,7 +4,7 @@ import threading
 import time
 import unittest
 
-from rbac import (
+from matrix.rbac import (
     Role,
     Permission,
     PermissionSet,

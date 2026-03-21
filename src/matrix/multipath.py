@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Dict, List, Optional, Tuple
 
-from jump_protocol import (
+from matrix.jump_protocol import (
     TransportBackend, JumpConnection, MsgType, ProtocolError,
     SessionKeys, client_handshake, server_handshake,
     CHUNK_SIZE, encode_frame, decode_frame,

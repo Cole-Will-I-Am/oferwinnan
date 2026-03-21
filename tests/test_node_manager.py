@@ -4,7 +4,7 @@ import threading
 import time
 import unittest
 
-from node_manager import (
+from matrix.node_manager import (
     NodeManager,
     ManagedNode,
     Task,
