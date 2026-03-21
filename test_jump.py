@@ -211,8 +211,8 @@ class TestKeyExchange(unittest.TestCase):
         priv_a, pub_a = generate_keypair()
         priv_b, pub_b = generate_keypair()
 
-        keys_a = derive_session_keys(priv_a, pub_b)
-        keys_b = derive_session_keys(priv_b, pub_a)
+        keys_a = derive_session_keys(priv_a, pub_b, is_initiator=True)
+        keys_b = derive_session_keys(priv_b, pub_a, is_initiator=False)
 
         plaintext = b"secret session data"
         ciphertext = keys_a.encrypt(plaintext)
@@ -224,8 +224,8 @@ class TestKeyExchange(unittest.TestCase):
         priv_b, pub_b = generate_keypair()
         priv_c, pub_c = generate_keypair()
 
-        keys_a = derive_session_keys(priv_a, pub_b)
-        keys_c = derive_session_keys(priv_c, pub_a)  # wrong key pair
+        keys_a = derive_session_keys(priv_a, pub_b, is_initiator=True)
+        keys_c = derive_session_keys(priv_c, pub_a, is_initiator=False)  # wrong key pair
 
         ciphertext = keys_a.encrypt(b"test")
         with self.assertRaises(Exception):

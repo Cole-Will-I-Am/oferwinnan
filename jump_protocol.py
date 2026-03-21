@@ -27,6 +27,9 @@ from typing import Callable, Dict, Optional, Protocol, runtime_checkable
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+from symmetric_ratchet import RatchetPair, RatchetError
 
 
 # == Protocol Constants ========================================================
@@ -264,20 +267,54 @@ class ProtocolError(Exception):
     pass
 
 
-# == Key Exchange (X25519 + Fernet) ============================================
+# == Key Exchange (X25519 + Ratcheted AES-256-GCM) ============================
+
+# Ratchet message header: 4-byte big-endian message index prepended to ciphertext
+_RATCHET_INDEX_SIZE = 4
+
 
 @dataclass
 class SessionKeys:
     shared_key: bytes       # raw 32-byte shared secret
-    fernet: Fernet          # derived Fernet instance for encrypt/decrypt
+    fernet: Fernet          # Fernet instance (fallback / legacy)
     peer_public: bytes      # peer's X25519 public key bytes
     connection_id: str = ""  # unique ID for session resumption
+    ratchet: Optional[RatchetPair] = None  # per-message forward secrecy
 
     def encrypt(self, data: bytes) -> bytes:
-        return self.fernet.encrypt(data)
+        """Encrypt data. Uses ratcheted AES-256-GCM if available, else Fernet."""
+        if self.ratchet is None:
+            return self.fernet.encrypt(data)
+
+        key, idx = self.ratchet.next_send_key()
+        nonce = os.urandom(12)
+        aesgcm = AESGCM(key)
+        ciphertext = aesgcm.encrypt(nonce, data, None)
+        # Wire format: [4-byte index][12-byte nonce][ciphertext+tag]
+        return struct.pack("!I", idx) + nonce + ciphertext
 
     def decrypt(self, token: bytes) -> bytes:
-        return self.fernet.decrypt(token)
+        """Decrypt data. Uses ratcheted AES-256-GCM if available, else Fernet."""
+        if self.ratchet is None:
+            return self.fernet.decrypt(token)
+
+        if len(token) < _RATCHET_INDEX_SIZE + 12:
+            raise ProtocolError("Ratcheted ciphertext too short")
+
+        idx = struct.unpack("!I", token[:_RATCHET_INDEX_SIZE])[0]
+        nonce = token[_RATCHET_INDEX_SIZE:_RATCHET_INDEX_SIZE + 12]
+        ciphertext = token[_RATCHET_INDEX_SIZE + 12:]
+
+        try:
+            key = self.ratchet.next_recv_key(idx)
+        except RatchetError as e:
+            raise ProtocolError(f"Ratchet key derivation failed: {e}") from e
+
+        aesgcm = AESGCM(key)
+        try:
+            return aesgcm.decrypt(nonce, ciphertext, None)
+        except Exception as e:
+            raise ProtocolError(f"AES-GCM decryption failed: {e}") from e
 
 
 def generate_keypair() -> tuple[x25519.X25519PrivateKey, bytes]:
@@ -291,8 +328,14 @@ def generate_keypair() -> tuple[x25519.X25519PrivateKey, bytes]:
 
 def derive_session_keys(private_key: x25519.X25519PrivateKey,
                         peer_public_bytes: bytes,
-                        connection_id: str = "") -> SessionKeys:
-    """Perform X25519 key agreement and derive a Fernet key via HKDF."""
+                        connection_id: str = "",
+                        is_initiator: bool = True) -> SessionKeys:
+    """Perform X25519 key agreement and derive ratcheted session keys.
+
+    The shared secret feeds both a Fernet key (for legacy/resumption fallback)
+    and a RatchetPair that provides per-message forward secrecy via
+    AES-256-GCM with Signal-spec KDF_CK chain ratcheting.
+    """
     from cryptography.hazmat.primitives.kdf.hkdf import HKDF
     from cryptography.hazmat.primitives import hashes
     import base64
@@ -306,11 +349,13 @@ def derive_session_keys(private_key: x25519.X25519PrivateKey,
         info=b"matrix-jump-v2",
     ).derive(shared)
     fernet_key = base64.urlsafe_b64encode(derived)
+    ratchet = RatchetPair(derived, is_initiator=is_initiator)
     return SessionKeys(
         shared_key=shared,
         fernet=Fernet(fernet_key),
         peer_public=peer_public_bytes,
         connection_id=connection_id or uuid.uuid4().hex[:16],
+        ratchet=ratchet,
     )
 
 
@@ -626,7 +671,8 @@ def client_handshake(backend, node_id: str,
     peer_pub = bytes.fromhex(peer_info["public_key"])
 
     new_conn_id = peer_info.get("connection_id", "")
-    keys = derive_session_keys(private_key, peer_pub, connection_id=new_conn_id)
+    keys = derive_session_keys(private_key, peer_pub, connection_id=new_conn_id,
+                               is_initiator=True)
     _key_cache.store(keys)
     return JumpConnection(backend, keys, is_initiator=True)
 
@@ -703,7 +749,8 @@ def server_handshake(backend,
     }).encode()
     send_frame_to(backend, MsgType.KEY_EXCHANGE_ACK, kx_resp)
 
-    keys = derive_session_keys(private_key, peer_pub, connection_id=conn_id)
+    keys = derive_session_keys(private_key, peer_pub, connection_id=conn_id,
+                               is_initiator=False)
     cache.store(keys)
     return JumpConnection(backend, keys, is_initiator=False,
                           peer_node_id=peer_node_id)
