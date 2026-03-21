@@ -94,6 +94,39 @@ def _probe_https(url: str, timeout: float) -> ProbeResult:
         return ProbeResult("https", False, error=str(e))
 
 
+class _DeadDropPlaceholder:
+    """Placeholder backend returned by dead-drop probes.
+
+    Satisfies the ``backend is not None`` check in negotiate() so that
+    dead-drop is considered connectable.  Must be replaced with a real
+    DeadDropBackend (supplying node IDs) before actual use.
+    """
+
+    def __init__(self, config) -> None:
+        self.config = config
+
+    def send_bytes(self, data: bytes) -> None:
+        raise NotImplementedError("replace placeholder with DeadDropBackend")
+
+    def recv_bytes(self, n: int) -> bytes:
+        raise NotImplementedError("replace placeholder with DeadDropBackend")
+
+    def close(self) -> None:
+        pass
+
+    @property
+    def peer_address(self) -> str:
+        return "dead-drop:placeholder"
+
+    @property
+    def transport_name(self) -> str:
+        return "dead-drop"
+
+    @property
+    def is_connected(self) -> bool:
+        return False
+
+
 class TransportNegotiator:
     """Probes multiple transports in parallel and selects the best one.
 
@@ -111,11 +144,13 @@ class TransportNegotiator:
     def __init__(self, host: str,
                  tcp_port: int = 47701,
                  ws_url: Optional[str] = None,
-                 https_url: Optional[str] = None):
+                 https_url: Optional[str] = None,
+                 dead_drop_config=None):
         self.host = host
         self.tcp_port = tcp_port
         self.ws_url = ws_url
         self.https_url = https_url
+        self.dead_drop_config = dead_drop_config  # Optional[DeadDropConfig]
 
     def negotiate(self, timeout: float = 5.0,
                   prefer: Optional[str] = None) -> ProbeResult:
@@ -145,6 +180,12 @@ class TransportNegotiator:
             https_url = self.https_url
             tasks.append(
                 ("https", lambda: _probe_https(https_url, timeout)),
+            )
+
+        if self.dead_drop_config is not None:
+            dd_config = self.dead_drop_config
+            tasks.append(
+                ("dead-drop", lambda: self._probe_dead_drop(dd_config, timeout)),
             )
 
         # Execute all probes in parallel
@@ -209,6 +250,34 @@ class TransportNegotiator:
                 r.backend.close()
 
         return winner
+
+    @staticmethod
+    def _probe_dead_drop(config, timeout: float) -> ProbeResult:
+        """Probe dead-drop transport availability.
+
+        Dead-drop always reports a high RTT penalty (10000ms) so it is only
+        selected as a last-resort fallback when all other transports fail.
+        Returns a _DeadDropPlaceholder as backend so the negotiator treats
+        it as connectable.
+        """
+        t0 = time.monotonic()
+        try:
+            from dead_drop import DeadDropBackend, CloudProvider, FileSystemDeadDrop
+            # For filesystem provider, verify the path exists
+            if config.provider == CloudProvider.FILESYSTEM:
+                import os
+                if not os.path.isdir(config.base_path):
+                    return ProbeResult("dead-drop", False,
+                                       error=f"base_path not found: {config.base_path}")
+            # Dead-drop is always "reachable" but slow — penalize RTT
+            rtt = (time.monotonic() - t0) * 1000 + 10000.0
+            # Return a placeholder backend so negotiate() treats this
+            # as connectable.  Callers must replace with a real
+            # DeadDropBackend (which requires node IDs) before use.
+            placeholder = _DeadDropPlaceholder(config)
+            return ProbeResult("dead-drop", True, rtt, placeholder)
+        except Exception as e:
+            return ProbeResult("dead-drop", False, error=str(e))
 
     def negotiate_multipath(self, timeout: float = 5.0
                             ) -> List[ProbeResult]:

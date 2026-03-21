@@ -697,18 +697,31 @@ class JumpNode:
 
     def __init__(self, node_name: str = None, listen_port: int = 47701,
                  auth_token: str = None,
-                 on_session_received=None):
+                 on_session_received=None,
+                 rbac_manager=None,
+                 task_relay=None):
         self.node_name = node_name or socket.gethostname()
         self.listen_port = listen_port
         self.auth_token = auth_token
         self.on_session_received = on_session_received
+        self._rbac_manager = rbac_manager
+        self._task_relay = task_relay
         self.discovery = DiscoveryManager(
             node_name=self.node_name,
             listen_port=listen_port,
         )
+
+        # Determine auth validator
+        auth_validator = None
+        if rbac_manager is not None:
+            from rbac import Permission
+            auth_validator = rbac_manager.make_auth_validator(Permission.JUMP)
+        elif auth_token:
+            auth_validator = self._validate_auth
+
         self.listener = JumpListener(
             port=listen_port,
-            auth_validator=self._validate_auth if auth_token else None,
+            auth_validator=auth_validator,
             on_connection=self._handle_connection,
         )
         self.received_sessions: list[JumpSession] = []
@@ -721,11 +734,27 @@ class JumpNode:
 
     def _handle_connection(self, conn: JumpConnection):
         try:
-            session = receive_session(conn, transfer_store=self._transfer_store)
-            with self._sessions_lock:
-                self.received_sessions.append(session)
-            if self.on_session_received:
-                self.on_session_received(session)
+            # Peek at message type to dispatch relay/terminate messages
+            msg_type, payload = conn.recv()
+            if msg_type == MsgType.RELAY and self._task_relay is not None:
+                import json as _json
+                from task_relay import RelayMessage
+                msg = RelayMessage.from_dict(_json.loads(payload.decode()))
+                self._task_relay.handle_incoming(msg)
+            elif msg_type == MsgType.ROUTE_UPDATE and self._task_relay is not None:
+                peer_id = conn.peer_node_id or conn.peer_address
+                self._task_relay.handle_route_update(peer_id, payload)
+            elif msg_type == MsgType.TERMINATE:
+                # Termination is handled by SecureTerminator if registered
+                logger.info("received TERMINATE from %s", conn.peer_address)
+            else:
+                # Re-inject the already-read frame and receive session
+                conn._pending_recv.appendleft((msg_type, payload))
+                session = receive_session(conn, transfer_store=self._transfer_store)
+                with self._sessions_lock:
+                    self.received_sessions.append(session)
+                if self.on_session_received:
+                    self.on_session_received(session)
         except (ProtocolError, ValueError, ConnectionError):
             pass
         finally:

@@ -58,6 +58,15 @@ class MsgType(IntEnum):
     HEARTBEAT_ACK = 0x43     # NEW: heartbeat response
     TRANSPORT_PROBE = 0x50   # NEW: transport negotiation probe
     TRANSPORT_SELECT = 0x51  # NEW: transport selection
+    TERMINATE = 0x60         # Secure termination command
+    TERMINATE_ACK = 0x61     # Termination acknowledgement
+    RELAY = 0x70             # Peer-to-peer relay message
+    RELAY_ACK = 0x71         # Relay acknowledgement
+    ROUTE_UPDATE = 0x72      # Relay routing table update
+    SYNC_MANIFEST = 0x80     # Data sync manifest exchange
+    SYNC_REQUEST = 0x81      # Data sync request
+    SYNC_CHUNK = 0x82        # Data sync chunk
+    SYNC_ACK = 0x83          # Data sync acknowledgement
     ERROR = 0xFF
 
 
@@ -314,10 +323,12 @@ class JumpConnection:
     Also accepts a raw socket.socket for backward compatibility.
     """
 
-    def __init__(self, backend, keys: SessionKeys, is_initiator: bool):
+    def __init__(self, backend, keys: SessionKeys, is_initiator: bool,
+                 peer_node_id: str = ""):
         self.backend: TransportBackend = _wrap_backend(backend)
         self.keys = keys
         self.is_initiator = is_initiator
+        self.peer_node_id = peer_node_id
         self._seq = 0
         self._lock = threading.Lock()
         self._recv_lock = threading.Lock()
@@ -639,6 +650,7 @@ def server_handshake(backend,
     hello_info = json.loads(payload.decode())
     requested_conn_id = hello_info.get("connection_id", "")
     hello_auth_token = hello_info.get("auth_token", "")
+    peer_node_id = hello_info.get("node_id", "")
 
     # Attempt 0-RTT resumption
     if requested_conn_id:
@@ -658,7 +670,8 @@ def server_handshake(backend,
                 "resumed": True,
             }).encode()
             send_frame_to(backend, MsgType.HELLO_ACK, ack)
-            return JumpConnection(backend, cached, is_initiator=False)
+            return JumpConnection(backend, cached, is_initiator=False,
+                                  peer_node_id=peer_node_id)
 
     # Normal handshake
     ack = json.dumps({
@@ -692,7 +705,8 @@ def server_handshake(backend,
 
     keys = derive_session_keys(private_key, peer_pub, connection_id=conn_id)
     cache.store(keys)
-    return JumpConnection(backend, keys, is_initiator=False)
+    return JumpConnection(backend, keys, is_initiator=False,
+                          peer_node_id=peer_node_id)
 
 
 # == Listener ==================================================================
