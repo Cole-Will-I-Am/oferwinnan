@@ -69,5 +69,17 @@ class MatrixConfig:
     auth_token: str | None = _env("MATRIX_AUTH_TOKEN", None)
     node_name: str | None = _env("MATRIX_NODE_NAME", None)
 
+    # LLM / Director
+    llm_backend: str = _env("MATRIX_LLM_BACKEND", "ollama")
+    llm_model: str = _env("MATRIX_LLM_MODEL", "")
+    llm_endpoint: str = _env("MATRIX_LLM_ENDPOINT", "http://127.0.0.1:11434")
+    llm_api_key: str | None = _env("MATRIX_LLM_API_KEY", None)
+    llm_timeout: float = _env("MATRIX_LLM_TIMEOUT", 30.0, float)
+    llm_action_budget: int = _env("MATRIX_LLM_ACTION_BUDGET", 5, int)
+    director_escalation_cooldown: float = _env("MATRIX_ESCALATION_COOLDOWN", 60.0, float)
+    director_degraded_sustain_s: float = _env("MATRIX_DEGRADED_SUSTAIN", 10.0, float)
+    director_task_failure_window: float = _env("MATRIX_TASK_FAILURE_WINDOW", 120.0, float)
+    director_task_failure_threshold: int = _env("MATRIX_TASK_FAILURE_THRESHOLD", 5, int)
+
 
 config = MatrixConfig()

@@ -66,6 +66,13 @@ class ResilienceManager:
         self._blender = blender
         self._slots: Dict[str, _FallbackSlot] = {}
         self._lock = threading.Lock()
+        self._on_exhausted: Optional[Callable[[str, int], None]] = None
+
+    def set_on_exhausted(
+        self, callback: Optional[Callable[[str, int], None]]
+    ) -> None:
+        """Register callback(slot_name, failure_count) when all fallbacks exhaust."""
+        self._on_exhausted = callback
 
     def protect(
         self,
@@ -182,6 +189,11 @@ class ResilienceManager:
                     except BlendError:
                         pass
                     slot.blend_key = ""
+                if self._on_exhausted:
+                    try:
+                        self._on_exhausted(slot.name, slot.failure_count)
+                    except Exception:
+                        logger.debug("on_exhausted callback error", exc_info=True)
 
 
 # ── Layer 2: Self-Customizing ────────────────────────────────────────────────

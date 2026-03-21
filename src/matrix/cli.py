@@ -357,6 +357,21 @@ def main():
     # config
     p_config = sub.add_parser("config", help="Show loaded configuration")
 
+    # director
+    p_director = sub.add_parser("director", help="Tri-State Director controls")
+    director_sub = p_director.add_subparsers(dest="director_command", required=True)
+    director_sub.add_parser("start", help="Start director alongside listener")
+    director_sub.add_parser("status", help="Show director state")
+    director_sub.add_parser("override", help="Human takes direct control")
+    director_sub.add_parser("release", help="Release human override")
+    director_sub.add_parser("audit", help="Show director audit log")
+    p_director_escalate = director_sub.add_parser(
+        "escalate", help="Manually trigger AI escalation"
+    )
+    p_director_escalate.add_argument(
+        "--reason", type=str, default="", help="Reason for manual escalation"
+    )
+
     args = parser.parse_args()
 
     # Validate port range
@@ -377,6 +392,7 @@ def main():
         "status": cmd_status,
         "rain": cmd_rain,
         "config": cmd_config,
+        "director": cmd_director,
     }
     commands[args.command](args)
 
@@ -398,11 +414,118 @@ def cmd_config(args):
     """Show the current loaded configuration."""
     from matrix.config import config
     from dataclasses import fields
+    _mask_fields = {"auth_token", "llm_api_key"}
     for f in fields(config):
         value = getattr(config, f.name)
-        if f.name == "auth_token" and value:
+        if f.name in _mask_fields and value:
             value = value[:4] + "****"
         logger.info(f"  {f.name:25s} = {value}")
+
+
+# ── Director Command Group ───────────────────────────────────────────────────
+
+# Global director reference (set by cmd_director start, used by subcommands).
+_director_instance = None
+
+
+def cmd_director(args):
+    """Tri-State Director controls."""
+    global _director_instance  # noqa: PLW0603
+
+    subcmd = args.director_command
+
+    if subcmd == "start":
+        _director_start(args)
+    elif subcmd == "status":
+        _director_status()
+    elif subcmd == "override":
+        _director_override()
+    elif subcmd == "release":
+        _director_release()
+    elif subcmd == "audit":
+        _director_audit()
+    elif subcmd == "escalate":
+        _director_escalate(args)
+
+
+def _director_start(args):
+    """Start the director alongside a listener node."""
+    global _director_instance  # noqa: PLW0603
+
+    from matrix.mirror_blend import MirrorRegistry, Blender
+    from matrix.autonomous import AutonomousLoop, system_metrics
+    from matrix.director import TriStateDirector
+
+    registry = MirrorRegistry()
+    blender = Blender(registry)
+    loop = AutonomousLoop(registry, blender, tick_interval=1.0)
+    loop.add_metrics_collector(system_metrics)
+    loop.start()
+
+    _director_instance = TriStateDirector(loop)
+    _director_instance.start()
+
+    logger.info("Director started.  State: %s", _director_instance.state.value)
+    logger.info("Press Ctrl+C to stop.")
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        _director_instance.stop()
+        loop.stop()
+        logger.info("Director stopped.")
+
+
+def _director_status():
+    if _director_instance is None:
+        logger.error("Director is not running.  Start it with: matrix director start")
+        return
+    import json as _json
+    logger.info(_json.dumps(_director_instance.status, indent=2))
+
+
+def _director_override():
+    if _director_instance is None:
+        logger.error("Director is not running.")
+        return
+    _director_instance.human_override()
+    logger.info("HUMAN OVERRIDE active.  Release with: matrix director release")
+
+
+def _director_release():
+    if _director_instance is None:
+        logger.error("Director is not running.")
+        return
+    try:
+        _director_instance.release_override()
+        logger.info("Override released.  State: AUTONOMOUS")
+    except Exception as exc:
+        logger.error("Release failed: %s", exc)
+
+
+def _director_audit():
+    if _director_instance is None:
+        logger.error("Director is not running.")
+        return
+    for entry in _director_instance.audit_log:
+        logger.info(
+            "[%s] %s  %s -> %s  %s",
+            time.strftime("%H:%M:%S", time.localtime(entry.timestamp)),
+            entry.category,
+            entry.from_state,
+            entry.to_state,
+            entry.details,
+        )
+    if not _director_instance.audit_log:
+        logger.info("No audit entries yet.")
+
+
+def _director_escalate(args):
+    if _director_instance is None:
+        logger.error("Director is not running.")
+        return
+    _director_instance.manual_escalate(reason=args.reason)
+    logger.info("Manual escalation triggered.")
 
 
 if __name__ == "__main__":
