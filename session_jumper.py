@@ -4,6 +4,9 @@ Session Jumper — Serialize, transfer, and resume sessions across devices.
 A "session" is a bundle of state (environment variables, working directory,
 open files, clipboard, arbitrary key-value data) that can be frozen on one
 device and thawed on another.
+
+Supports resumable transfers: if a connection drops mid-transfer, the
+receiver can reconnect and continue from the last acknowledged chunk.
 """
 
 import gzip
@@ -19,11 +22,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Dict, Optional
 
 from device_discovery import Device, Transport, DiscoveryManager
 from jump_protocol import (
     JumpConnection, JumpListener, MsgType, ProtocolError,
+    TransportBackend, DirectTCPBackend, _wrap_backend,
     client_handshake, CHUNK_SIZE,
 )
 
@@ -33,7 +37,7 @@ logger = logging.getLogger(__name__)
 MAX_FILE_SIZE = 10 * 1024 * 1024
 
 
-# ── Session Model ────────────────────────────────────────────────────────────
+# == Session Model =============================================================
 
 @dataclass
 class JumpSession:
@@ -44,7 +48,7 @@ class JumpSession:
     cwd: str = ""
     env: dict = field(default_factory=dict)
     clipboard: str = ""
-    files: dict = field(default_factory=dict)  # relative_path → bytes (base64)
+    files: dict = field(default_factory=dict)  # relative_path -> bytes (base64)
     metadata: dict = field(default_factory=dict)
     checksum: str = ""
 
@@ -173,36 +177,151 @@ def restore_session(session: JumpSession, restore_env: bool = False,
     return session.metadata
 
 
-# ── Jump Sender / Receiver ───────────────────────────────────────────────────
+# == Transfer State (for resumption) ===========================================
 
-def send_session(conn: JumpConnection, session: JumpSession) -> bool:
-    """Send a session over an established JumpConnection."""
+@dataclass
+class TransferState:
+    """Tracks the progress of a session transfer for resumption."""
+    session_id: str
+    total_size: int
+    checksum: str
+    last_acked_offset: int = 0
+    last_acked_seq: int = -1
+    chunks_received: int = 0
+    buffer: bytearray = field(default_factory=bytearray, repr=False)
+    created_at: float = field(default_factory=time.time)
+
+    @property
+    def is_complete(self) -> bool:
+        return len(self.buffer) >= self.total_size
+
+    @property
+    def progress(self) -> float:
+        if self.total_size == 0:
+            return 1.0
+        return len(self.buffer) / self.total_size
+
+    def to_resume_info(self) -> dict:
+        """Info sent to the sender when resuming."""
+        return {
+            "session_id": self.session_id,
+            "resume_offset": self.last_acked_offset,
+            "resume_seq": self.last_acked_seq,
+            "received_size": len(self.buffer),
+            "partial_hash": hashlib.sha256(self.buffer).hexdigest(),
+        }
+
+
+class TransferStateStore:
+    """Thread-safe store for in-progress transfer states.
+
+    Enables resumption: if a connection drops, the receiver can look up the
+    partial state and tell the sender where to continue from.
+    """
+
+    def __init__(self, ttl: float = 300.0):
+        self._states: Dict[str, TransferState] = {}
+        self._ttl = ttl
+        self._lock = threading.Lock()
+
+    def get_or_create(self, session_id: str, total_size: int,
+                      checksum: str) -> TransferState:
+        with self._lock:
+            self._evict()
+            state = self._states.get(session_id)
+            if state and state.total_size == total_size:
+                return state
+            state = TransferState(
+                session_id=session_id,
+                total_size=total_size,
+                checksum=checksum,
+            )
+            self._states[session_id] = state
+            return state
+
+    def get(self, session_id: str) -> Optional[TransferState]:
+        with self._lock:
+            self._evict()
+            return self._states.get(session_id)
+
+    def remove(self, session_id: str) -> None:
+        with self._lock:
+            self._states.pop(session_id, None)
+
+    def _evict(self):
+        now = time.time()
+        expired = [k for k, v in self._states.items()
+                   if now - v.created_at > self._ttl]
+        for k in expired:
+            del self._states[k]
+
+
+# Global transfer state store
+_transfer_store = TransferStateStore(ttl=300.0)
+
+
+# == Jump Sender / Receiver ====================================================
+
+def send_session(conn: JumpConnection, session: JumpSession,
+                 on_chunk_ack: Optional[Callable[[int, int], None]] = None,
+                 ) -> bool:
+    """Send a session over an established JumpConnection.
+
+    Supports resumable transfers: if the receiver sends a RESUME with an
+    offset, the sender skips ahead to that point.
+
+    Args:
+        conn: Established encrypted connection.
+        session: The session to transfer.
+        on_chunk_ack: Optional callback(offset, total_size) after each chunk ACK.
+
+    Returns:
+        True if the session was fully received.
+    """
     data = session.serialize()
+    total_size = len(data)
     meta = {
         "session_id": session.session_id,
         "source": session.source_device,
-        "size": len(data),
+        "size": total_size,
         "checksum": session.checksum,
         "timestamp": session.timestamp,
+        "resumable": True,
     }
     conn.send_json(MsgType.SESSION_DATA, {"meta": meta, "stage": "meta"})
 
-    # Wait for ready signal
+    # Wait for ready signal (or resume signal)
     msg_type, resp = conn.recv_json()
     if msg_type == MsgType.ERROR:
         raise ProtocolError(f"Receiver rejected session: {resp}")
 
+    # Check for resume
+    start_offset = 0
+    start_seq = 0
+    if msg_type == MsgType.RESUME_ACK:
+        start_offset = resp.get("resume_offset", 0)
+        start_seq = resp.get("resume_seq", 0) + 1
+        logger.info("Resuming transfer from offset %d (seq %d)", start_offset, start_seq)
+    elif msg_type == MsgType.SESSION_ACK:
+        pass  # Fresh start
+    else:
+        # Legacy receiver — treat any other ACK-like response as ready
+        pass
+
     # Send data in chunks
-    offset = 0
-    seq = 0
-    while offset < len(data):
+    offset = start_offset
+    seq = start_seq
+    while offset < total_size:
         chunk = data[offset:offset + CHUNK_SIZE]
         chunk_meta = {"seq": seq, "offset": offset, "size": len(chunk),
-                      "final": offset + len(chunk) >= len(data)}
+                      "final": offset + len(chunk) >= total_size}
         payload = json.dumps(chunk_meta).encode() + b"\x00" + chunk
         conn.send(MsgType.FILE_CHUNK, payload)
         offset += len(chunk)
         seq += 1
+
+        if on_chunk_ack:
+            on_chunk_ack(offset, total_size)
 
     # Wait for final ACK
     msg_type, ack = conn.recv_json()
@@ -211,8 +330,23 @@ def send_session(conn: JumpConnection, session: JumpSession) -> bool:
     return ack.get("status") == "ok"
 
 
-def receive_session(conn: JumpConnection) -> JumpSession:
-    """Receive a session over an established JumpConnection."""
+def receive_session(conn: JumpConnection,
+                    transfer_store: Optional[TransferStateStore] = None,
+                    ) -> JumpSession:
+    """Receive a session over an established JumpConnection.
+
+    Supports resumable transfers: if we have partial state from a previous
+    attempt, we tell the sender where to resume from.
+
+    Args:
+        conn: Established encrypted connection.
+        transfer_store: Optional store for partial transfer state.
+
+    Returns:
+        The received JumpSession.
+    """
+    store = transfer_store or _transfer_store
+
     # Get metadata
     msg_type, info = conn.recv_json()
     if msg_type != MsgType.SESSION_DATA:
@@ -220,37 +354,123 @@ def receive_session(conn: JumpConnection) -> JumpSession:
 
     meta = info["meta"]
     expected_size = meta["size"]
+    session_id = meta.get("session_id", "")
+    checksum = meta.get("checksum", "")
+    resumable = meta.get("resumable", False)
 
-    # Signal ready
-    conn.send_json(MsgType.SESSION_ACK, {"status": "ready"})
+    # Check for existing partial transfer state
+    state = store.get(session_id) if resumable and session_id else None
+
+    if state and state.total_size == expected_size and len(state.buffer) > 0:
+        # Resume from where we left off
+        logger.info("Resuming session %s from offset %d/%d",
+                     session_id, state.last_acked_offset, expected_size)
+        conn.send_json(MsgType.RESUME_ACK, state.to_resume_info())
+    else:
+        # Fresh transfer
+        state = store.get_or_create(session_id, expected_size, checksum)
+        conn.send_json(MsgType.SESSION_ACK, {"status": "ready"})
 
     # Receive chunks
-    buf = bytearray()
-    while len(buf) < expected_size:
+    while len(state.buffer) < expected_size:
         msg_type, raw = conn.recv()
         if msg_type != MsgType.FILE_CHUNK:
             raise ProtocolError(f"Expected FILE_CHUNK, got {msg_type}")
         sep = raw.find(b"\x00")
         if sep == -1:
             raise ValueError("Invalid session data: missing separator")
+
+        chunk_meta_bytes = raw[:sep]
         chunk_data = raw[sep + 1:]
-        buf.extend(chunk_data)
+        chunk_meta = json.loads(chunk_meta_bytes.decode())
 
-    session = JumpSession.deserialize(bytes(buf))
+        chunk_offset = chunk_meta.get("offset", len(state.buffer))
+        chunk_seq = chunk_meta.get("seq", state.chunks_received)
+        chunk_size = chunk_meta.get("size", len(chunk_data))
 
-    if meta.get("checksum") and session.compute_checksum() != meta["checksum"]:
+        if chunk_size != len(chunk_data):
+            conn.send_json(MsgType.ERROR, {
+                "error": "invalid_chunk_size",
+                "declared": chunk_size,
+                "actual": len(chunk_data),
+            })
+            raise ProtocolError(
+                f"Chunk size mismatch: declared {chunk_size}, got {len(chunk_data)} bytes"
+            )
+
+        # Handle out-of-order or duplicate chunks
+        if chunk_offset < len(state.buffer):
+            # Duplicate chunk — skip it
+            continue
+        elif chunk_offset > len(state.buffer):
+            conn.send_json(MsgType.ERROR, {
+                "error": "chunk_gap",
+                "expected_offset": len(state.buffer),
+                "got_offset": chunk_offset,
+            })
+            raise ProtocolError(
+                f"Chunk gap: expected offset {len(state.buffer)}, got {chunk_offset}"
+            )
+
+        next_size = len(state.buffer) + len(chunk_data)
+        if next_size > expected_size:
+            conn.send_json(MsgType.ERROR, {
+                "error": "chunk_overflow",
+                "expected_size": expected_size,
+                "would_be_size": next_size,
+            })
+            raise ProtocolError(
+                f"Chunk overflow: expected total <= {expected_size}, got {next_size}"
+            )
+
+        state.buffer.extend(chunk_data)
+        state.last_acked_offset = chunk_offset + len(chunk_data)
+        state.last_acked_seq = chunk_seq
+        state.chunks_received += 1
+
+    session = JumpSession.deserialize(bytes(state.buffer))
+
+    if checksum and session.compute_checksum() != checksum:
         conn.send_json(MsgType.SESSION_ACK, {"status": "checksum_error"})
         raise ValueError("Session checksum mismatch")
 
     conn.send_json(MsgType.SESSION_ACK, {"status": "ok"})
+
+    # Clean up transfer state
+    store.remove(session_id)
+
     return session
 
 
-# ── High-level jump operations ───────────────────────────────────────────────
+# == High-level jump operations ================================================
 
 def jump_to_device(target: Device, session: JumpSession,
-                   auth_token: str = None, timeout: float = 30.0) -> bool:
-    """Jump to a target device: connect, handshake, send session."""
+                   auth_token: str = None, timeout: float = 30.0,
+                   backend: Optional[TransportBackend] = None) -> bool:
+    """Jump to a target device: connect, handshake, send session.
+
+    Args:
+        target: Target device to jump to.
+        session: Session to transfer.
+        auth_token: Optional authentication token.
+        timeout: Connection timeout.
+        backend: Optional pre-connected TransportBackend. If None, creates
+                 a DirectTCPBackend.
+
+    Returns:
+        True if the session was accepted.
+    """
+    if backend:
+        # Use provided backend (WebSocket, relay, etc.)
+        try:
+            conn = client_handshake(backend, session.source_device, auth_token)
+            return send_session(conn, session)
+        except (OSError, ProtocolError, ConnectionError) as e:
+            raise JumpError(f"Failed to jump to {target.name}: {e}") from e
+        finally:
+            backend.close()
+
+    # Default: direct TCP
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(timeout)
     try:
@@ -270,7 +490,7 @@ class JumpError(Exception):
     pass
 
 
-# ── Multi-target Jump (Multiply / Duplicate) ────────────────────────────────
+# == Multi-target Jump (Multiply / Duplicate) ==================================
 
 class MultiJumpStrategy(Enum):
     """Strategy for dispatching a session to multiple targets."""
@@ -493,6 +713,7 @@ class JumpNode:
         )
         self.received_sessions: list[JumpSession] = []
         self._sessions_lock = threading.Lock()
+        self._transfer_store = TransferStateStore(ttl=300.0)
 
     def _validate_auth(self, token: str) -> bool:
         # Constant-time comparison to prevent timing attacks
@@ -500,7 +721,7 @@ class JumpNode:
 
     def _handle_connection(self, conn: JumpConnection):
         try:
-            session = receive_session(conn)
+            session = receive_session(conn, transfer_store=self._transfer_store)
             with self._sessions_lock:
                 self.received_sessions.append(session)
             if self.on_session_received:
@@ -523,7 +744,8 @@ class JumpNode:
 
     def jump(self, target: Device, session_id: str = None,
              include_env: bool = True, include_files: list[str] = None,
-             extra_metadata: dict = None) -> bool:
+             extra_metadata: dict = None,
+             backend: Optional[TransportBackend] = None) -> bool:
         sid = session_id or f"jump-{int(time.time())}"
         session = capture_session(
             session_id=sid,
@@ -532,7 +754,8 @@ class JumpNode:
             include_files=include_files,
             extra_metadata=extra_metadata,
         )
-        return jump_to_device(target, session, auth_token=self.auth_token)
+        return jump_to_device(target, session, auth_token=self.auth_token,
+                              backend=backend)
 
     def multi_jump(
         self,
