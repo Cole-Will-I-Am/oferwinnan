@@ -10,6 +10,8 @@ def apply_security_hardening():
     if getattr(jp, "_SECURITY_HARDENED", False):
         return
 
-    def client_handshake(backend, node_id: str, auth_token: str = None,
-                         connection_id: str = None):
-        backend
+    original_listener_init = jp.JumpListener.__init__
+
+    def hardened_listener_init(self, host="127.0.0.1", port=47701,
+                               auth_validator=None, on_connection=None,
+                               max_connections=64):
