@@ -28,6 +28,25 @@ from matrix.session_jumper import (
 logger = logging.getLogger(__name__)
 
 
+def _build_identity_context(args):
+    """Build (identity, trust_store, require_peer_identity) from args/config."""
+    from matrix.identity import IdentityKey, PeerTrustStore
+
+    identity = None
+    path = getattr(args, "identity", None) or _config.identity_file
+    if path:
+        identity = IdentityKey.load_or_create(path)
+
+    trust_store = None
+    peers = getattr(args, "known_peers", None) or _config.known_peers_file
+    if peers:
+        trust_store = PeerTrustStore(peers, tofu=_config.trust_on_first_use)
+
+    require = bool(getattr(args, "require_identity", False)
+                   or _config.require_peer_identity)
+    return identity, trust_store, require
+
+
 def _maybe_restore_files(session: JumpSession, mode: str) -> None:
     """Restore received files according to policy: ask, always, or never."""
     if not session.files:
@@ -69,11 +88,15 @@ def cmd_listen(args):
         except Exception:
             logger.exception("Failed to process received session '%s'", session.session_id)
 
+    identity, trust_store, require_identity = _build_identity_context(args)
     node = JumpNode(
         node_name=args.name or socket.gethostname(),
         listen_port=args.port,
         auth_token=args.token,
         on_session_received=on_session,
+        identity=identity,
+        trust_store=trust_store,
+        require_peer_identity=require_identity,
     )
     try:
         node.start()
@@ -85,6 +108,10 @@ def cmd_listen(args):
     logger.info(f"Node ID: {node.discovery.node_id}")
     if args.token:
         logger.info("Authentication: enabled")
+    if identity:
+        logger.info(f"Identity fingerprint: {identity.fingerprint}")
+    if require_identity:
+        logger.info("Peer identity: required")
     logger.info("Waiting for incoming jumps... (Ctrl+C to stop)\n")
 
     try:
@@ -126,9 +153,13 @@ def cmd_discover(args):
 
 def cmd_jump(args):
     """Jump to a target device, transferring current session."""
+    identity, trust_store, require_identity = _build_identity_context(args)
     node = JumpNode(
         listen_port=args.port,
         auth_token=args.token,
+        identity=identity,
+        trust_store=trust_store,
+        require_peer_identity=require_identity,
     )
     node.start()
     logger.info(f"Resolving target '{args.target}'...")
@@ -167,9 +198,13 @@ def cmd_jump(args):
 
 def cmd_multiply(args):
     """Multiply/duplicate the session to multiple targets simultaneously."""
+    identity, trust_store, require_identity = _build_identity_context(args)
     node = JumpNode(
         listen_port=args.port,
         auth_token=args.token,
+        identity=identity,
+        trust_store=trust_store,
+        require_peer_identity=require_identity,
     )
     node.start()
 
@@ -309,6 +344,15 @@ def main():
                              "(default: MATRIX_AUTH_TOKEN)")
     parser.add_argument("--name", type=str, default=None,
                         help="Node name (default: hostname)")
+    parser.add_argument("--identity", type=str, default=None, metavar="PATH",
+                        help="Ed25519 identity key file, created if absent "
+                             "(default: MATRIX_IDENTITY_FILE)")
+    parser.add_argument("--known-peers", type=str, default=None, metavar="PATH",
+                        help="Peer trust store file for identity pinning "
+                             "(default: MATRIX_KNOWN_PEERS)")
+    parser.add_argument("--require-identity", action="store_true",
+                        help="Require the peer to present a verified identity "
+                             "(defeats MITM on the key exchange)")
 
     sub = parser.add_subparsers(dest="command", required=True)
 

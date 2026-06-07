@@ -476,6 +476,154 @@ class TestAuthTokenConfidentiality(unittest.TestCase):
             s2.close()
 
 
+class TestAuthenticatedHandshake(unittest.TestCase):
+    """Mutual identity authentication (SIGMA-style) over the key exchange."""
+
+    def _run(self, client_kwargs, server_kwargs):
+        s1, s2 = socket.socketpair()
+        s1.settimeout(5)
+        s2.settimeout(5)
+        out = {}
+
+        def server_side():
+            try:
+                out["conn"] = server_handshake(s2, **server_kwargs)
+            except Exception as e:  # noqa: BLE001
+                out["error"] = e
+
+        t = threading.Thread(target=server_side)
+        t.start()
+        try:
+            client_conn = client_handshake(s1, "client", **client_kwargs)
+            t.join(timeout=5)
+            out["client"] = client_conn
+        except Exception as e:  # noqa: BLE001
+            out["client_error"] = e
+            t.join(timeout=5)
+        finally:
+            pass
+        return out, (s1, s2)
+
+    def test_mutual_identity_success_and_pinning(self):
+        from matrix.identity import IdentityKey, PeerTrustStore
+
+        client_id = IdentityKey.generate()
+        server_id = IdentityKey.generate()
+        client_store = PeerTrustStore(tofu=True)
+        server_store = PeerTrustStore(tofu=True)
+
+        out, socks = self._run(
+            client_kwargs=dict(
+                identity=client_id, trust_store=client_store,
+                expected_peer="server", require_peer_identity=True),
+            server_kwargs=dict(
+                identity=server_id, trust_store=server_store,
+                require_peer_identity=True),
+        )
+        try:
+            self.assertNotIn("error", out, f"server: {out.get('error')}")
+            self.assertNotIn("client_error", out, f"client: {out.get('client_error')}")
+            # Both identities were pinned during the exchange.
+            self.assertEqual(client_store.get("server"), server_id.public_bytes)
+            self.assertEqual(server_store.get("client"), client_id.public_bytes)
+            # Encrypted channel works end to end.
+            out["client"].send(MsgType.SESSION_DATA, b"ping")
+            self.assertEqual(out["conn"].recv()[1], b"ping")
+            out["client"].close()
+            out["conn"].close()
+        finally:
+            socks[0].close()
+            socks[1].close()
+
+    def test_require_server_identity_but_none_offered(self):
+        out, socks = self._run(
+            client_kwargs=dict(require_peer_identity=True),
+            server_kwargs=dict(),  # server has no identity
+        )
+        try:
+            self.assertIn("client_error", out)
+            self.assertIsInstance(out["client_error"], ProtocolError)
+        finally:
+            socks[0].close()
+            socks[1].close()
+
+    def test_pinned_server_key_mismatch_rejected(self):
+        from matrix.identity import IdentityKey, PeerTrustStore
+
+        server_id = IdentityKey.generate()
+        attacker_id = IdentityKey.generate()
+        # Client has already pinned a DIFFERENT key for "server".
+        client_store = PeerTrustStore(tofu=True)
+        client_store.pin("server", attacker_id.public_bytes)
+
+        out, socks = self._run(
+            client_kwargs=dict(trust_store=client_store, expected_peer="server",
+                               require_peer_identity=True),
+            server_kwargs=dict(identity=server_id),
+        )
+        try:
+            self.assertIn("client_error", out)
+            self.assertIsInstance(out["client_error"], ProtocolError)
+            self.assertIn("not trusted", str(out["client_error"]))
+        finally:
+            socks[0].close()
+            socks[1].close()
+
+    def test_mitm_substituted_ephemeral_rejected(self):
+        """A signature over a different ephemeral than the one delivered fails.
+
+        Simulates an active MITM that forwards a server identity signature but
+        swaps the ephemeral key — the transcript binding must reject it.
+        """
+        from matrix.identity import IdentityKey
+        from matrix.jump_protocol import (
+            generate_keypair, _handshake_transcript, PROTOCOL_VERSION,
+            recv_frame_from, send_frame_to,
+        )
+        import json as _json
+
+        server_id = IdentityKey.generate()
+        s1, s2 = socket.socketpair()
+        s1.settimeout(5)
+        s2.settimeout(5)
+        b2 = DirectTCPBackend(s2)
+
+        def malicious_server():
+            # HELLO
+            recv_frame_from(b2)
+            send_frame_to(b2, MsgType.HELLO_ACK, _json.dumps(
+                {"version": PROTOCOL_VERSION, "status": "ok", "resumed": False}
+            ).encode())
+            # KEY_EXCHANGE from client
+            _, _, kx = recv_frame_from(b2)
+            client_eph = bytes.fromhex(_json.loads(kx.decode())["public_key"])
+            # Honestly sign over a transcript, but DELIVER a different ephemeral.
+            _, signed_eph = generate_keypair()
+            _, delivered_eph = generate_keypair()
+            transcript = _handshake_transcript(client_eph, signed_eph,
+                                               PROTOCOL_VERSION)
+            resp = {
+                "public_key": delivered_eph.hex(),   # != signed_eph
+                "connection_id": "x",
+                "auth_required": False,
+                "require_peer_identity": False,
+                "identity_pub": server_id.public_bytes.hex(),
+                "identity_sig": server_id.sign(b"server-id" + transcript).hex(),
+            }
+            send_frame_to(b2, MsgType.KEY_EXCHANGE_ACK,
+                          _json.dumps(resp).encode())
+
+        t = threading.Thread(target=malicious_server)
+        t.start()
+        try:
+            with self.assertRaises(ProtocolError):
+                client_handshake(s1, "client", require_peer_identity=True)
+            t.join(timeout=5)
+        finally:
+            s1.close()
+            s2.close()
+
+
 class TestListenerBindHardening(unittest.TestCase):
     """An unauthenticated listener must not bind a public interface."""
 

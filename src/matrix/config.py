@@ -69,6 +69,12 @@ class MatrixConfig:
     auth_token: str | None = _env("MATRIX_AUTH_TOKEN", None)
     node_name: str | None = _env("MATRIX_NODE_NAME", None)
 
+    # Identity / peer trust (mutual authentication)
+    identity_file: str | None = _env("MATRIX_IDENTITY_FILE", None)
+    known_peers_file: str | None = _env("MATRIX_KNOWN_PEERS", None)
+    require_peer_identity: bool = _env("MATRIX_REQUIRE_IDENTITY", False, bool)
+    trust_on_first_use: bool = _env("MATRIX_TOFU", True, bool)
+
     # LLM / Director
     llm_backend: str = _env("MATRIX_LLM_BACKEND", "ollama")
     llm_model: str = _env("MATRIX_LLM_MODEL", "")

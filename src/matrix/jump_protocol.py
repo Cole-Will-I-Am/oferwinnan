@@ -30,6 +30,9 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from matrix.symmetric_ratchet import RatchetPair, RatchetError
+from matrix.identity import (
+    IdentityKey, IdentityError, PeerTrustStore, verify_signature,
+)
 
 
 # == Protocol Constants ========================================================
@@ -45,6 +48,21 @@ CHUNK_SIZE = _config.chunk_size       # 64 KiB transfer chunks
 
 # Seconds to wait for the encrypted AUTH exchange after key agreement.
 AUTH_TIMEOUT = 30.0
+
+# Cipher-suite tag bound into the handshake transcript for downgrade protection.
+HANDSHAKE_SUITE = b"X25519-AES256GCM-Ed25519"
+
+
+def _handshake_transcript(client_eph: bytes, server_eph: bytes,
+                          version: int) -> bytes:
+    """Deterministic transcript bound by identity signatures (SIGMA-style).
+
+    Binds both ephemeral X25519 public keys plus the protocol version and
+    cipher suite, so a signature proves the signer participated in *this*
+    exchange and pins the suite (defeating MITM and downgrade).
+    """
+    return (b"matrix-sigma-v1" + struct.pack("!B", version & 0xFF)
+            + HANDSHAKE_SUITE + client_eph + server_eph)
 
 
 class MsgType(IntEnum):
@@ -643,7 +661,12 @@ _key_cache = SessionKeyCache(ttl=60.0)
 
 def client_handshake(backend, node_id: str,
                      auth_token: str = None,
-                     connection_id: str = None) -> JumpConnection:
+                     connection_id: str = None,
+                     *,
+                     identity: Optional[IdentityKey] = None,
+                     trust_store: Optional[PeerTrustStore] = None,
+                     expected_peer: Optional[str] = None,
+                     require_peer_identity: bool = False) -> JumpConnection:
     """Perform a client-side handshake: HELLO -> KEY_EXCHANGE -> done.
 
     Accepts a socket.socket or TransportBackend.
@@ -651,6 +674,14 @@ def client_handshake(backend, node_id: str,
 
     The auth token is never placed on the wire in cleartext: authentication
     happens over the encrypted channel after key agreement (AUTH/AUTH_OK).
+
+    Mutual authentication (defeats active MITM on the unauthenticated DH):
+      - ``identity`` — this node's Ed25519 identity; presented to the server
+        (encrypted) when the server requests a client identity.
+      - ``require_peer_identity`` — abort unless the server proves its identity
+        with a signature over the handshake transcript.
+      - ``trust_store`` / ``expected_peer`` — pin/verify the server identity
+        under ``expected_peer`` (TOFU or strict allowlist).
     """
     backend = _wrap_backend(backend)
     conn_id = connection_id or ""
@@ -660,6 +691,8 @@ def client_handshake(backend, node_id: str,
         "node_id": node_id,
         "version": PROTOCOL_VERSION,
         "connection_id": conn_id,
+        "require_peer_identity": bool(require_peer_identity),
+        "can_present_identity": identity is not None,
     }).encode()
     send_frame_to(backend, MsgType.HELLO, hello)
 
@@ -672,7 +705,8 @@ def client_handshake(backend, node_id: str,
 
     ack_info = json.loads(payload.decode())
 
-    # Check for 0-RTT resumption
+    # Check for 0-RTT resumption (cached keys themselves prove the peer; the
+    # identity exchange is bound to fresh ephemerals and so is skipped here).
     if ack_info.get("resumed") and conn_id:
         cached = _key_cache.get(conn_id)
         if not cached:
@@ -699,6 +733,24 @@ def client_handshake(backend, node_id: str,
     peer_info = json.loads(kx_resp.decode())
     peer_pub = bytes.fromhex(peer_info["public_key"])
 
+    transcript = _handshake_transcript(pub_bytes, peer_pub, PROTOCOL_VERSION)
+
+    # Verify the server's identity (binds it to this exchange) before deriving
+    # keys, so a MITM that swapped ephemerals is rejected here.
+    server_id_hex = peer_info.get("identity_pub")
+    if require_peer_identity and not server_id_hex:
+        raise ProtocolError("Server did not present a required identity")
+    if server_id_hex:
+        server_id = bytes.fromhex(server_id_hex)
+        sig = bytes.fromhex(peer_info.get("identity_sig", ""))
+        if not verify_signature(server_id, sig, b"server-id" + transcript):
+            raise ProtocolError("Server identity signature is invalid")
+        if trust_store is not None and expected_peer is not None:
+            try:
+                trust_store.verify(expected_peer, server_id)
+            except IdentityError as e:
+                raise ProtocolError(f"Server identity not trusted: {e}") from e
+
     new_conn_id = peer_info.get("connection_id", "")
     keys = derive_session_keys(private_key, peer_pub, connection_id=new_conn_id,
                                is_initiator=True)
@@ -706,19 +758,34 @@ def client_handshake(backend, node_id: str,
     conn = JumpConnection(backend, keys, is_initiator=True)
 
     # Authenticate over the encrypted channel before any session traffic.
-    _client_authenticate(conn, auth_token, peer_info.get("auth_required"))
+    _client_authenticate(
+        conn, auth_token, peer_info.get("auth_required"),
+        must_present_identity=bool(peer_info.get("require_peer_identity")),
+        identity=identity, transcript=transcript,
+    )
     return conn
 
 
 def _client_authenticate(conn: JumpConnection, auth_token: Optional[str],
-                         auth_required) -> None:
-    """Send the auth token over the encrypted channel and await AUTH_OK.
+                         auth_required, *,
+                         must_present_identity: bool = False,
+                         identity: Optional[IdentityKey] = None,
+                         transcript: bytes = b"") -> None:
+    """Send token (and identity proof, if required) over the encrypted channel.
 
-    No-op when the server did not request authentication.
+    No-op when the server requested neither token auth nor a client identity.
     """
-    if not auth_required:
+    if not (auth_required or must_present_identity):
         return
-    conn.send(MsgType.AUTH, json.dumps({"auth_token": auth_token or ""}).encode())
+    if must_present_identity and identity is None:
+        raise ProtocolError(
+            "Server requires a client identity but none is configured"
+        )
+    payload = {"auth_token": auth_token or ""}
+    if identity is not None:
+        payload["identity_pub"] = identity.public_bytes.hex()
+        payload["identity_sig"] = identity.sign(b"client-id" + transcript).hex()
+    conn.send(MsgType.AUTH, json.dumps(payload).encode())
     try:
         msg_type, payload = conn.recv(timeout=AUTH_TIMEOUT)
     except (TimeoutError, ConnectionError) as e:
@@ -735,7 +802,10 @@ def _client_authenticate(conn: JumpConnection, auth_token: Optional[str],
 def server_handshake(backend,
                      auth_validator: Callable[[str], bool] = None,
                      key_cache: Optional[SessionKeyCache] = None,
-                     ) -> JumpConnection:
+                     *,
+                     identity: Optional[IdentityKey] = None,
+                     trust_store: Optional[PeerTrustStore] = None,
+                     require_peer_identity: bool = False) -> JumpConnection:
     """Perform a server-side handshake: receive HELLO -> KEY_EXCHANGE -> done.
 
     Accepts a socket.socket or TransportBackend.
@@ -743,6 +813,13 @@ def server_handshake(backend,
     When an auth_validator is supplied, the client must authenticate over the
     encrypted channel (AUTH/AUTH_OK) after key agreement; the token is never
     accepted in cleartext, including on the 0-RTT resumption path.
+
+    Mutual authentication:
+      - ``identity`` — this node's Ed25519 identity; presented to the client
+        (signed over the transcript) so the client can defeat MITM.
+      - ``require_peer_identity`` — require the client to prove its identity
+        with a transcript signature; combined with ``trust_store`` this
+        enforces a pinned/allowlisted set of client identities.
     """
     backend = _wrap_backend(backend)
     cache = key_cache or _key_cache
@@ -757,7 +834,13 @@ def server_handshake(backend,
     requested_conn_id = hello_info.get("connection_id", "")
     peer_node_id = hello_info.get("node_id", "")
 
-    # Attempt 0-RTT resumption
+    # Fail fast if the client demands a server identity we cannot provide.
+    if hello_info.get("require_peer_identity") and identity is None:
+        send_frame_to(backend, MsgType.ERROR, b"Server identity required but not configured")
+        raise ProtocolError("Client required a server identity but none is configured")
+
+    # Attempt 0-RTT resumption (possession of the cached keys authenticates the
+    # peer; identity is bound to fresh ephemerals so it is not re-checked here).
     if requested_conn_id:
         cached = cache.get(requested_conn_id)
         if cached:
@@ -792,12 +875,20 @@ def server_handshake(backend,
     # Generate our keypair and respond
     private_key, pub_bytes = generate_keypair()
     conn_id = uuid.uuid4().hex[:16]
-    kx_resp = json.dumps({
+    transcript = _handshake_transcript(peer_pub, pub_bytes, PROTOCOL_VERSION)
+
+    resp = {
         "public_key": pub_bytes.hex(),
         "connection_id": conn_id,
         "auth_required": auth_required,
-    }).encode()
-    send_frame_to(backend, MsgType.KEY_EXCHANGE_ACK, kx_resp)
+        "require_peer_identity": bool(require_peer_identity),
+    }
+    # Present our identity, signed over the transcript, so the client can bind
+    # this exchange to a verified server identity.
+    if identity is not None:
+        resp["identity_pub"] = identity.public_bytes.hex()
+        resp["identity_sig"] = identity.sign(b"server-id" + transcript).hex()
+    send_frame_to(backend, MsgType.KEY_EXCHANGE_ACK, json.dumps(resp).encode())
 
     keys = derive_session_keys(private_key, peer_pub, connection_id=conn_id,
                                is_initiator=False)
@@ -806,17 +897,26 @@ def server_handshake(backend,
                           peer_node_id=peer_node_id)
 
     # Authenticate over the encrypted channel before any session traffic.
-    _server_authenticate(conn, auth_validator)
+    _server_authenticate(
+        conn, auth_validator,
+        require_client_identity=require_peer_identity,
+        trust_store=trust_store, peer_name=peer_node_id, transcript=transcript,
+    )
     return conn
 
 
 def _server_authenticate(conn: JumpConnection,
-                         auth_validator: Optional[Callable[[str], bool]]) -> None:
-    """Require an encrypted AUTH frame carrying a valid token, then AUTH_OK.
+                         auth_validator: Optional[Callable[[str], bool]],
+                         *,
+                         require_client_identity: bool = False,
+                         trust_store: Optional[PeerTrustStore] = None,
+                         peer_name: str = "",
+                         transcript: bytes = b"") -> None:
+    """Require an encrypted AUTH frame (token and/or identity proof), then AUTH_OK.
 
-    No-op when authentication is not configured.
+    No-op when neither token auth nor a client identity is required.
     """
-    if auth_validator is None:
+    if auth_validator is None and not require_client_identity:
         return
     try:
         msg_type, payload = conn.recv(timeout=AUTH_TIMEOUT)
@@ -826,11 +926,30 @@ def _server_authenticate(conn: JumpConnection,
         _try_send_error(conn, b"Authentication required")
         raise ProtocolError(f"Expected AUTH, got {msg_type}")
     try:
-        token = json.loads(payload.decode()).get("auth_token", "")
+        info = json.loads(payload.decode())
     except (ValueError, UnicodeDecodeError) as e:
         _try_send_error(conn, b"Malformed authentication")
         raise ProtocolError(f"Malformed AUTH payload: {e}") from e
-    if not auth_validator(token):
+
+    # Verify client identity (signature over the transcript + trust pinning).
+    if require_client_identity:
+        client_id_hex = info.get("identity_pub")
+        if not client_id_hex:
+            _try_send_error(conn, b"Client identity required")
+            raise ProtocolError("Client did not present a required identity")
+        client_id = bytes.fromhex(client_id_hex)
+        sig = bytes.fromhex(info.get("identity_sig", ""))
+        if not verify_signature(client_id, sig, b"client-id" + transcript):
+            _try_send_error(conn, b"Client identity signature invalid")
+            raise ProtocolError("Client identity signature is invalid")
+        if trust_store is not None:
+            try:
+                trust_store.verify(peer_name, client_id)
+            except IdentityError as e:
+                _try_send_error(conn, b"Client identity not trusted")
+                raise ProtocolError(f"Client identity not trusted: {e}") from e
+
+    if auth_validator is not None and not auth_validator(info.get("auth_token", "")):
         _try_send_error(conn, b"Authentication failed")
         raise ProtocolError("Authentication failed")
     conn.send(MsgType.AUTH_OK, b"")
@@ -856,11 +975,17 @@ class JumpListener:
     def __init__(self, host: str = "0.0.0.0", port: int = 47701,
                  auth_validator: Callable[[str], bool] = None,
                  on_connection: Callable[[JumpConnection], None] = None,
-                 max_connections: int = 64):
+                 max_connections: int = 64,
+                 identity: Optional[IdentityKey] = None,
+                 trust_store: Optional[PeerTrustStore] = None,
+                 require_peer_identity: bool = False):
         self.host = host
         self.port = port
         self.auth_validator = auth_validator
         self.on_connection = on_connection
+        self.identity = identity
+        self.trust_store = trust_store
+        self.require_peer_identity = require_peer_identity
         self._server_sock: Optional[socket.socket] = None
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -907,6 +1032,9 @@ class JumpListener:
                 backend,
                 auth_validator=self.auth_validator,
                 key_cache=self._key_cache,
+                identity=self.identity,
+                trust_store=self.trust_store,
+                require_peer_identity=self.require_peer_identity,
             )
             if self.on_connection:
                 threading.Thread(

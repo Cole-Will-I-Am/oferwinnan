@@ -127,6 +127,10 @@ cp .env.example .env
 | `MATRIX_MAX_FILE_SIZE` | `10485760` | Max file size for session capture (bytes) |
 | `MATRIX_AUTH_TOKEN` | | Authentication token for secure jumps |
 | `MATRIX_NODE_NAME` | | Custom node name (default: hostname) |
+| `MATRIX_IDENTITY_FILE` | | Ed25519 identity key file (created if absent); enables mutual auth |
+| `MATRIX_KNOWN_PEERS` | | Peer trust store file for identity pinning |
+| `MATRIX_REQUIRE_IDENTITY` | `false` | Require the peer to present a verified identity |
+| `MATRIX_TOFU` | `true` | Trust-on-first-use; set `false` for strict allowlist mode |
 | `MATRIX_LLM_BACKEND` | `ollama` | LLM provider: `ollama` or `anthropic` |
 | `MATRIX_LLM_MODEL` | | Model name (required when director is used) |
 | `MATRIX_LLM_ENDPOINT` | `http://127.0.0.1:11434` | Ollama API endpoint |
@@ -182,6 +186,7 @@ Safety constraints: action budget (default 5), dead-man's switch timeout, AST qu
 
 - **Forward secrecy**: Signal-spec symmetric ratchet (KDF_CK) with per-message AES-256-GCM keys
 - **Key exchange**: X25519 ECDH with HKDF-SHA256 derivation
+- **Mutual authentication**: Ed25519 node identities signed into the handshake transcript (SIGMA-style) defeat active MITM on the key exchange; SSH-style peer pinning (TOFU or strict allowlist) via a trust store. See [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
 - **Authentication**: encrypted post-handshake `AUTH`/`AUTH_OK` exchange — the token is never sent in cleartext (including on 0-RTT resume); RBAC with constant-time token comparison
 - **Safe binding**: an unauthenticated listener refuses to bind a public interface; set an auth token to listen beyond `127.0.0.1`
 - **Replay protection**: Nonce tracking with TTL expiry

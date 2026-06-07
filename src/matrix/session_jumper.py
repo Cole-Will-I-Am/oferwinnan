@@ -448,7 +448,11 @@ def receive_session(conn: JumpConnection,
 
 def jump_to_device(target: Device, session: JumpSession,
                    auth_token: str = None, timeout: float = 30.0,
-                   backend: Optional[TransportBackend] = None) -> bool:
+                   backend: Optional[TransportBackend] = None,
+                   *,
+                   identity=None, trust_store=None,
+                   require_peer_identity: bool = False,
+                   expected_peer: Optional[str] = None) -> bool:
     """Jump to a target device: connect, handshake, send session.
 
     Args:
@@ -458,14 +462,24 @@ def jump_to_device(target: Device, session: JumpSession,
         timeout: Connection timeout.
         backend: Optional pre-connected TransportBackend. If None, creates
                  a DirectTCPBackend.
+        identity: Optional Ed25519 IdentityKey presented to the target.
+        trust_store: Optional PeerTrustStore for pinning the target identity.
+        require_peer_identity: Abort unless the target proves its identity.
+        expected_peer: Trust-store key for the target (defaults to its address).
 
     Returns:
         True if the session was accepted.
     """
+    peer_name = expected_peer or f"{target.address}:{target.port}"
+    hs_kwargs = dict(identity=identity, trust_store=trust_store,
+                     expected_peer=peer_name,
+                     require_peer_identity=require_peer_identity)
+
     if backend:
         # Use provided backend (WebSocket, relay, etc.)
         try:
-            conn = client_handshake(backend, session.source_device, auth_token)
+            conn = client_handshake(backend, session.source_device, auth_token,
+                                    **hs_kwargs)
             return send_session(conn, session)
         except (OSError, ProtocolError, ConnectionError) as e:
             raise JumpError(f"Failed to jump to {target.name}: {e}") from e
@@ -477,7 +491,8 @@ def jump_to_device(target: Device, session: JumpSession,
     sock.settimeout(timeout)
     try:
         sock.connect((target.address, target.port))
-        conn = client_handshake(sock, session.source_device, auth_token)
+        conn = client_handshake(sock, session.source_device, auth_token,
+                                **hs_kwargs)
         return send_session(conn, session)
     except (OSError, ProtocolError, ConnectionError) as e:
         raise JumpError(f"Failed to jump to {target.name}: {e}") from e
@@ -556,6 +571,10 @@ def _jump_single(
     auth_token: str = None,
     timeout: float = 30.0,
     max_retries: int = 0,
+    *,
+    identity=None,
+    trust_store=None,
+    require_peer_identity: bool = False,
 ) -> TargetResult:
     """Jump to one target with optional retries. Returns a TargetResult."""
     t0 = time.time()
@@ -563,7 +582,9 @@ def _jump_single(
     for attempt in range(1 + max_retries):
         try:
             ok = jump_to_device(target, session, auth_token=auth_token,
-                                timeout=timeout)
+                                timeout=timeout, identity=identity,
+                                trust_store=trust_store,
+                                require_peer_identity=require_peer_identity)
             return TargetResult(
                 device=target, success=ok,
                 elapsed=time.time() - t0, retries=attempt,
@@ -589,6 +610,9 @@ def jump_to_devices(
     max_retries: int = 0,
     max_workers: int = 0,
     on_progress: Callable[[TargetResult, int, int], None] = None,
+    identity=None,
+    trust_store=None,
+    require_peer_identity: bool = False,
 ) -> MultiJumpResult:
     """Jump a session to multiple targets using the chosen strategy.
 
@@ -617,13 +641,16 @@ def jump_to_devices(
         targets=[], started=time.time(),
     )
 
+    hs = dict(identity=identity, trust_store=trust_store,
+              require_peer_identity=require_peer_identity)
+
     if strategy == MultiJumpStrategy.CASCADE:
         return _cascade_jump(targets, session, result,
-                             auth_token, timeout, max_retries, on_progress)
+                             auth_token, timeout, max_retries, on_progress, hs)
 
     if strategy == MultiJumpStrategy.RACE:
         return _race_jump(targets, session, result, workers,
-                          auth_token, timeout, max_retries, on_progress)
+                          auth_token, timeout, max_retries, on_progress, hs)
 
     # BROADCAST and MIRROR: dispatch all concurrently
     completed = 0
@@ -632,7 +659,7 @@ def jump_to_devices(
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {
             pool.submit(_jump_single, t, session, auth_token, timeout,
-                        max_retries): t
+                        max_retries, **hs): t
             for t in targets
         }
         for future in as_completed(futures):
@@ -653,10 +680,11 @@ def jump_to_devices(
 
 
 def _cascade_jump(targets, session, result, auth_token, timeout,
-                  max_retries, on_progress):
+                  max_retries, on_progress, hs=None):
     """Sequential jump — each target only attempted after the previous succeeds."""
+    hs = hs or {}
     for i, target in enumerate(targets):
-        tr = _jump_single(target, session, auth_token, timeout, max_retries)
+        tr = _jump_single(target, session, auth_token, timeout, max_retries, **hs)
         result.targets.append(tr)
         if on_progress:
             on_progress(tr, i + 1, len(targets))
@@ -667,15 +695,16 @@ def _cascade_jump(targets, session, result, auth_token, timeout,
 
 
 def _race_jump(targets, session, result, workers, auth_token, timeout,
-               max_retries, on_progress):
+               max_retries, on_progress, hs=None):
     """First successful delivery wins; remaining futures are cancelled."""
+    hs = hs or {}
     winner_found = threading.Event()
 
     def _race_single(target):
         if winner_found.is_set():
             return TargetResult(device=target, success=False,
                                 error="cancelled (race lost)")
-        tr = _jump_single(target, session, auth_token, timeout, max_retries)
+        tr = _jump_single(target, session, auth_token, timeout, max_retries, **hs)
         if tr.success:
             winner_found.set()
         return tr
@@ -701,13 +730,19 @@ class JumpNode:
                  auth_token: str = None,
                  on_session_received=None,
                  rbac_manager=None,
-                 task_relay=None):
+                 task_relay=None,
+                 identity=None,
+                 trust_store=None,
+                 require_peer_identity: bool = False):
         self.node_name = node_name or socket.gethostname()
         self.listen_port = listen_port
         self.auth_token = auth_token
         self.on_session_received = on_session_received
         self._rbac_manager = rbac_manager
         self._task_relay = task_relay
+        self.identity = identity
+        self.trust_store = trust_store
+        self.require_peer_identity = require_peer_identity
         self.discovery = DiscoveryManager(
             node_name=self.node_name,
             listen_port=listen_port,
@@ -725,6 +760,9 @@ class JumpNode:
             port=listen_port,
             auth_validator=auth_validator,
             on_connection=self._handle_connection,
+            identity=identity,
+            trust_store=trust_store,
+            require_peer_identity=require_peer_identity,
         )
         self.received_sessions: list[JumpSession] = []
         self._sessions_lock = threading.Lock()
@@ -788,7 +826,9 @@ class JumpNode:
             extra_metadata=extra_metadata,
         )
         return jump_to_device(target, session, auth_token=self.auth_token,
-                              backend=backend)
+                              backend=backend, identity=self.identity,
+                              trust_store=self.trust_store,
+                              require_peer_identity=self.require_peer_identity)
 
     def multi_jump(
         self,
@@ -853,4 +893,7 @@ class JumpNode:
             max_retries=max_retries,
             max_workers=max_workers,
             on_progress=on_progress,
+            identity=self.identity,
+            trust_store=self.trust_store,
+            require_peer_identity=self.require_peer_identity,
         )
