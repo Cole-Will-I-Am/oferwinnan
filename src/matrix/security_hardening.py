@@ -1,10 +1,15 @@
-"""Runtime security hardening for Matrix jump protocol defaults.
+"""Security hardening patches for Matrix jump protocol defaults."""
 
-This module patches the public jump protocol entry points without changing the
-wire framing primitives. It addresses two high-risk defaults:
+import json
 
-* bearer auth tokens are no longer sent in plaintext HELLO/KEY_EXCHANGE frames;
-* TCP listeners no longer bind publicly without authentication.
 
-The hardened handshake authenticates after X25519 key agreement by sending the
-bearer token inside the newly encrypted channel. Auth
+def apply_security_hardening():
+    """Patch jump protocol defaults once per interpreter."""
+    import matrix.jump_protocol as jp
+
+    if getattr(jp, "_SECURITY_HARDENED", False):
+        return
+
+    def client_handshake(backend, node_id: str, auth_token: str = None,
+                         connection_id: str = None):
+        backend
