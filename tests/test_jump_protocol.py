@@ -1,0 +1,701 @@
+"""Tests for matrix.jump_protocol — frame encoding, transport backends, key exchange, caching."""
+
+import json
+import socket
+import struct
+import threading
+import time
+import unittest
+from unittest.mock import MagicMock, patch
+
+from matrix.jump_protocol import (
+    MsgType, ProtocolError, HEADER_MAGIC, HEADER_SIZE, PROTOCOL_VERSION,
+    encode_frame, decode_frame,
+    recv_frame_from, send_frame_to,
+    DirectTCPBackend, _wrap_backend,
+    generate_keypair, derive_session_keys,
+    SessionKeys, SessionKeyCache,
+    JumpConnection, JumpListener,
+    client_handshake, server_handshake,
+    _nonce_from_index, _RATCHET_INDEX_SIZE, _GCM_TAG_SIZE,
+)
+
+
+class TestFrameEncoding(unittest.TestCase):
+    """Test encode_frame and decode_frame."""
+
+    def test_roundtrip(self):
+        payload = b"hello world"
+        frame = encode_frame(MsgType.SESSION_DATA, payload, seq=42)
+        msg_type, seq, decoded_payload = decode_frame(frame)
+        self.assertEqual(msg_type, MsgType.SESSION_DATA)
+        self.assertEqual(seq, 42)
+        self.assertEqual(decoded_payload, payload)
+
+    def test_empty_payload(self):
+        frame = encode_frame(MsgType.PING, b"", seq=0)
+        msg_type, seq, payload = decode_frame(frame)
+        self.assertEqual(msg_type, MsgType.PING)
+        self.assertEqual(payload, b"")
+
+    def test_header_structure(self):
+        frame = encode_frame(MsgType.HELLO, b"test", seq=1)
+        self.assertTrue(frame.startswith(HEADER_MAGIC))
+        self.assertEqual(len(frame), HEADER_SIZE + 4)
+
+    def test_decode_invalid_magic(self):
+        with self.assertRaises(ProtocolError):
+            decode_frame(b"BAAD" + b"\x00" * 20)
+
+    def test_decode_truncated(self):
+        with self.assertRaises(ProtocolError):
+            decode_frame(b"JMP\x01" + b"\x00" * 3)
+
+    def test_decode_truncated_payload(self):
+        # Build a frame header claiming 100 bytes but only provide 5
+        header = HEADER_MAGIC + struct.pack("!BBII", PROTOCOL_VERSION,
+                                             int(MsgType.PING), 0, 100)
+        with self.assertRaises(ProtocolError):
+            decode_frame(header + b"short")
+
+    def test_all_msg_types_encodable(self):
+        for mt in MsgType:
+            frame = encode_frame(mt, b"x")
+            msg_type, _, _ = decode_frame(frame)
+            self.assertEqual(msg_type, mt)
+
+    def test_large_payload(self):
+        payload = b"x" * 65536
+        frame = encode_frame(MsgType.FILE_CHUNK, payload)
+        _, _, decoded = decode_frame(frame)
+        self.assertEqual(decoded, payload)
+
+
+class TestDirectTCPBackend(unittest.TestCase):
+    """Test DirectTCPBackend wrapper."""
+
+    def test_properties(self):
+        sock = MagicMock(spec=socket.socket)
+        sock.getpeername.return_value = ("10.0.0.1", 47701)
+        backend = DirectTCPBackend(sock)
+        self.assertEqual(backend.transport_name, "tcp")
+        self.assertEqual(backend.peer_address, "10.0.0.1:47701")
+        self.assertTrue(backend.is_connected)
+
+    def test_send_bytes(self):
+        sock = MagicMock(spec=socket.socket)
+        sock.getpeername.return_value = ("10.0.0.1", 1234)
+        backend = DirectTCPBackend(sock)
+        backend.send_bytes(b"hello")
+        sock.sendall.assert_called_once_with(b"hello")
+
+    def test_send_bytes_failure(self):
+        sock = MagicMock(spec=socket.socket)
+        sock.getpeername.return_value = ("10.0.0.1", 1234)
+        sock.sendall.side_effect = OSError("broken pipe")
+        backend = DirectTCPBackend(sock)
+        with self.assertRaises(ConnectionError):
+            backend.send_bytes(b"data")
+        self.assertFalse(backend.is_connected)
+
+    def test_recv_bytes(self):
+        sock = MagicMock(spec=socket.socket)
+        sock.getpeername.return_value = ("10.0.0.1", 1234)
+        sock.recv.side_effect = [b"hel", b"lo"]
+        backend = DirectTCPBackend(sock)
+        result = backend.recv_bytes(5)
+        self.assertEqual(result, b"hello")
+
+    def test_recv_bytes_closed(self):
+        sock = MagicMock(spec=socket.socket)
+        sock.getpeername.return_value = ("10.0.0.1", 1234)
+        sock.recv.return_value = b""
+        backend = DirectTCPBackend(sock)
+        with self.assertRaises(ConnectionError):
+            backend.recv_bytes(5)
+
+    def test_close_idempotent(self):
+        sock = MagicMock(spec=socket.socket)
+        sock.getpeername.return_value = ("10.0.0.1", 1234)
+        backend = DirectTCPBackend(sock)
+        backend.close()
+        backend.close()  # Should not raise
+        self.assertFalse(backend.is_connected)
+
+    def test_peer_address_unknown(self):
+        sock = MagicMock(spec=socket.socket)
+        sock.getpeername.side_effect = OSError()
+        backend = DirectTCPBackend(sock)
+        self.assertEqual(backend.peer_address, "unknown")
+
+
+class TestWrapBackend(unittest.TestCase):
+    """Test _wrap_backend helper."""
+
+    def test_wraps_socket(self):
+        sock = MagicMock(spec=socket.socket)
+        sock.getpeername.return_value = ("1.2.3.4", 80)
+        backend = _wrap_backend(sock)
+        self.assertIsInstance(backend, DirectTCPBackend)
+
+    def test_passes_through_backend(self):
+        sock = MagicMock(spec=socket.socket)
+        sock.getpeername.return_value = ("1.2.3.4", 80)
+        original = DirectTCPBackend(sock)
+        result = _wrap_backend(original)
+        self.assertIs(result, original)
+
+    def test_rejects_invalid_type(self):
+        with self.assertRaises(TypeError):
+            _wrap_backend("not a socket")
+
+
+class TestBackendFrameIO(unittest.TestCase):
+    """Test recv_frame_from and send_frame_to."""
+
+    def test_send_and_recv_via_backend(self):
+        # Use a real socketpair for integration
+        s1, s2 = socket.socketpair()
+        s1.settimeout(5)
+        s2.settimeout(5)
+
+        try:
+            b1 = DirectTCPBackend(s1)
+            b2 = DirectTCPBackend(s2)
+
+            send_frame_to(b1, MsgType.PING, b"ping-data", seq=7)
+            msg_type, seq, payload = recv_frame_from(b2)
+
+            self.assertEqual(msg_type, MsgType.PING)
+            self.assertEqual(seq, 7)
+            self.assertEqual(payload, b"ping-data")
+        finally:
+            s1.close()
+            s2.close()
+
+
+class TestKeyExchange(unittest.TestCase):
+    """Test X25519 key generation and derivation."""
+
+    def test_generate_keypair(self):
+        private, pub_bytes = generate_keypair()
+        self.assertEqual(len(pub_bytes), 32)
+
+    def test_derive_session_keys(self):
+        priv_a, pub_a = generate_keypair()
+        priv_b, pub_b = generate_keypair()
+
+        keys_a = derive_session_keys(priv_a, pub_b, is_initiator=True)
+        keys_b = derive_session_keys(priv_b, pub_a, is_initiator=False)
+
+        self.assertEqual(keys_a.shared_key, keys_b.shared_key)
+        self.assertIsNotNone(keys_a.ratchet)
+        self.assertIsNotNone(keys_b.ratchet)
+
+    def test_encrypt_decrypt_roundtrip(self):
+        priv_a, pub_a = generate_keypair()
+        priv_b, pub_b = generate_keypair()
+
+        keys_a = derive_session_keys(priv_a, pub_b, is_initiator=True)
+        keys_b = derive_session_keys(priv_b, pub_a, is_initiator=False)
+
+        plaintext = b"secret message"
+        ciphertext = keys_a.encrypt(plaintext)
+        self.assertNotEqual(ciphertext, plaintext)
+
+        decrypted = keys_b.decrypt(ciphertext)
+        self.assertEqual(decrypted, plaintext)
+
+    def test_encrypt_decrypt_multiple_messages(self):
+        priv_a, pub_a = generate_keypair()
+        priv_b, pub_b = generate_keypair()
+
+        keys_a = derive_session_keys(priv_a, pub_b, is_initiator=True)
+        keys_b = derive_session_keys(priv_b, pub_a, is_initiator=False)
+
+        for i in range(5):
+            msg = f"message {i}".encode()
+            ct = keys_a.encrypt(msg)
+            pt = keys_b.decrypt(ct)
+            self.assertEqual(pt, msg)
+
+    def test_clone_keys(self):
+        priv, pub = generate_keypair()
+        priv2, pub2 = generate_keypair()
+        keys = derive_session_keys(priv, pub2, is_initiator=True)
+        cloned = keys.clone()
+        self.assertEqual(cloned.shared_key, keys.shared_key)
+        self.assertEqual(cloned.connection_id, keys.connection_id)
+
+
+class TestSessionKeyCache(unittest.TestCase):
+    """Test SessionKeyCache TTL and operations."""
+
+    def _make_keys(self, conn_id="test-conn"):
+        priv, pub = generate_keypair()
+        priv2, pub2 = generate_keypair()
+        keys = derive_session_keys(priv, pub2, connection_id=conn_id,
+                                   is_initiator=True)
+        return keys
+
+    def test_store_and_get(self):
+        cache = SessionKeyCache(ttl=60)
+        keys = self._make_keys("conn-1")
+        cache.store(keys)
+        retrieved = cache.get("conn-1")
+        self.assertIsNotNone(retrieved)
+        self.assertEqual(retrieved.connection_id, "conn-1")
+
+    def test_get_nonexistent(self):
+        cache = SessionKeyCache(ttl=60)
+        self.assertIsNone(cache.get("nonexistent"))
+
+    def test_remove(self):
+        cache = SessionKeyCache(ttl=60)
+        keys = self._make_keys("conn-2")
+        cache.store(keys)
+        cache.remove("conn-2")
+        self.assertIsNone(cache.get("conn-2"))
+
+    def test_ttl_eviction(self):
+        cache = SessionKeyCache(ttl=0.0)
+        keys = self._make_keys("conn-3")
+        cache.store(keys)
+        # Force eviction by accessing after TTL
+        time.sleep(0.01)
+        self.assertIsNone(cache.get("conn-3"))
+
+
+class TestJumpConnection(unittest.TestCase):
+    """Test JumpConnection send/recv over socketpair."""
+
+    def _make_connected_pair(self):
+        """Create a pair of JumpConnections sharing derived keys."""
+        s1, s2 = socket.socketpair()
+        s1.settimeout(5)
+        s2.settimeout(5)
+
+        priv_a, pub_a = generate_keypair()
+        priv_b, pub_b = generate_keypair()
+        keys_a = derive_session_keys(priv_a, pub_b, is_initiator=True)
+        keys_b = derive_session_keys(priv_b, pub_a, is_initiator=False)
+
+        conn_a = JumpConnection(s1, keys_a, is_initiator=True)
+        conn_b = JumpConnection(s2, keys_b, is_initiator=False)
+        return conn_a, conn_b
+
+    def test_send_recv(self):
+        a, b = self._make_connected_pair()
+        try:
+            a.send(MsgType.SESSION_DATA, b"test payload")
+            msg_type, payload = b.recv()
+            self.assertEqual(msg_type, MsgType.SESSION_DATA)
+            self.assertEqual(payload, b"test payload")
+        finally:
+            a.close()
+            b.close()
+
+    def test_send_recv_json(self):
+        a, b = self._make_connected_pair()
+        try:
+            a.send_json(MsgType.SESSION_ACK, {"status": "ok"})
+            msg_type, obj = b.recv_json()
+            self.assertEqual(msg_type, MsgType.SESSION_ACK)
+            self.assertEqual(obj["status"], "ok")
+        finally:
+            a.close()
+            b.close()
+
+    def test_ping(self):
+        a, b = self._make_connected_pair()
+
+        def respond_to_ping():
+            msg_type, payload = b.recv()
+            if msg_type == MsgType.PING:
+                b.send(MsgType.PONG, b"pong")
+
+        t = threading.Thread(target=respond_to_ping)
+        t.start()
+        try:
+            rtt = a.ping(timeout=5.0)
+            self.assertGreater(rtt, 0)
+        finally:
+            t.join(timeout=5)
+            a.close()
+            b.close()
+
+    def test_connection_properties(self):
+        a, b = self._make_connected_pair()
+        try:
+            self.assertTrue(a.is_connected)
+            self.assertEqual(a.transport_name, "tcp")
+            self.assertTrue(a.connection_id)
+        finally:
+            a.close()
+            b.close()
+
+
+class TestHandshake(unittest.TestCase):
+    """Test client/server handshake over socketpair."""
+
+    def test_full_handshake(self):
+        s1, s2 = socket.socketpair()
+        s1.settimeout(5)
+        s2.settimeout(5)
+
+        result = {}
+
+        def server_side():
+            try:
+                conn = server_handshake(s2)
+                result["conn"] = conn
+            except Exception as e:
+                result["error"] = e
+
+        t = threading.Thread(target=server_side)
+        t.start()
+
+        try:
+            client_conn = client_handshake(s1, "test-client")
+            t.join(timeout=5)
+
+            self.assertIn("conn", result, f"Server error: {result.get('error')}")
+            server_conn = result["conn"]
+
+            # Test encrypted communication
+            client_conn.send(MsgType.SESSION_DATA, b"from client")
+            msg_type, payload = server_conn.recv()
+            self.assertEqual(payload, b"from client")
+
+            server_conn.send(MsgType.SESSION_ACK, b"from server")
+            msg_type, payload = client_conn.recv()
+            self.assertEqual(payload, b"from server")
+        finally:
+            s1.close()
+            s2.close()
+
+    def test_handshake_with_auth(self):
+        s1, s2 = socket.socketpair()
+        s1.settimeout(5)
+        s2.settimeout(5)
+
+        result = {}
+
+        def server_side():
+            try:
+                def validator(token):
+                    return token == "secret"
+                conn = server_handshake(s2, auth_validator=validator)
+                result["conn"] = conn
+            except Exception as e:
+                result["error"] = e
+
+        t = threading.Thread(target=server_side)
+        t.start()
+
+        try:
+            client_conn = client_handshake(s1, "test-client", auth_token="secret")
+            t.join(timeout=5)
+            self.assertIn("conn", result)
+        finally:
+            s1.close()
+            s2.close()
+
+    def test_handshake_auth_failure(self):
+        s1, s2 = socket.socketpair()
+        s1.settimeout(5)
+        s2.settimeout(5)
+
+        result = {}
+
+        def server_side():
+            try:
+                def validator(token):
+                    return token == "correct"
+                conn = server_handshake(s2, auth_validator=validator)
+                result["conn"] = conn
+            except ProtocolError as e:
+                result["error"] = e
+
+        t = threading.Thread(target=server_side)
+        t.start()
+
+        try:
+            with self.assertRaises(ProtocolError):
+                client_handshake(s1, "test-client", auth_token="wrong")
+            t.join(timeout=5)
+            self.assertIn("error", result)
+        finally:
+            s1.close()
+            s2.close()
+
+
+class TestSessionCryptoHardening(unittest.TestCase):
+    """Fernet removed, counter-based nonces, fail-closed encryption."""
+
+    def _pair(self):
+        priv_a, pub_a = generate_keypair()
+        priv_b, pub_b = generate_keypair()
+        a = derive_session_keys(priv_a, pub_b, is_initiator=True)
+        b = derive_session_keys(priv_b, pub_a, is_initiator=False)
+        return a, b
+
+    def test_no_fernet_attribute(self):
+        a, _ = self._pair()
+        self.assertFalse(hasattr(a, "fernet"))
+
+    def test_fail_closed_without_ratchet(self):
+        keys = SessionKeys(shared_key=b"\x00" * 32, peer_public=b"\x00" * 32,
+                           ratchet=None)
+        with self.assertRaises(ProtocolError):
+            keys.encrypt(b"data")
+        with self.assertRaises(ProtocolError):
+            keys.decrypt(b"\x00" * 32)
+
+    def test_nonce_is_deterministic_counter(self):
+        self.assertEqual(_nonce_from_index(0), b"\x00" * 12)
+        self.assertEqual(len(_nonce_from_index(1)), 12)
+        self.assertTrue(_nonce_from_index(1).endswith(b"\x01"))
+        self.assertNotEqual(_nonce_from_index(1), _nonce_from_index(2))
+
+    def test_wire_format_has_no_nonce(self):
+        a, b = self._pair()
+        # Empty plaintext -> 4-byte index + 16-byte GCM tag only (no nonce).
+        ct = a.encrypt(b"")
+        self.assertEqual(len(ct), _RATCHET_INDEX_SIZE + _GCM_TAG_SIZE)
+        # Index prefix increments per message and round-trips in order.
+        self.assertEqual(ct[:_RATCHET_INDEX_SIZE], b"\x00\x00\x00\x00")
+        ct1 = a.encrypt(b"hello")
+        self.assertEqual(ct1[:_RATCHET_INDEX_SIZE], b"\x00\x00\x00\x01")
+        self.assertEqual(b.decrypt(ct), b"")
+        self.assertEqual(b.decrypt(ct1), b"hello")
+
+    def test_tamper_is_rejected(self):
+        a, b = self._pair()
+        ct = bytearray(a.encrypt(b"secret"))
+        ct[-1] ^= 0x01  # flip a tag bit
+        with self.assertRaises(ProtocolError):
+            b.decrypt(bytes(ct))
+
+
+class TestAuthTokenConfidentiality(unittest.TestCase):
+    """The auth token must never travel on the wire in cleartext."""
+
+    def test_token_absent_from_handshake_frames(self):
+        s1, s2 = socket.socketpair()
+        s1.settimeout(5)
+        s2.settimeout(5)
+
+        token = "super-secret-token-value"
+        result = {}
+
+        def server_side():
+            try:
+                result["conn"] = server_handshake(
+                    s2, auth_validator=lambda t: t == token
+                )
+            except Exception as e:  # noqa: BLE001
+                result["error"] = e
+
+        # Record every byte the client transmits.
+        sent_chunks = []
+
+        class RecordingBackend(DirectTCPBackend):
+            def send_bytes(self, data: bytes) -> None:
+                sent_chunks.append(bytes(data))
+                super().send_bytes(data)
+
+        t = threading.Thread(target=server_side)
+        t.start()
+        try:
+            conn = client_handshake(RecordingBackend(s1), "client", auth_token=token)
+            t.join(timeout=5)
+            self.assertIn("conn", result, f"Server error: {result.get('error')}")
+
+            wire = b"".join(sent_chunks)
+            self.assertNotIn(token.encode(), wire,
+                             "Auth token leaked into handshake bytes")
+            # The encrypted AUTH exchange still authenticated successfully.
+            conn.send(MsgType.SESSION_DATA, b"hi")
+            self.assertEqual(result["conn"].recv()[1], b"hi")
+            conn.close()
+            result["conn"].close()
+        finally:
+            s1.close()
+            s2.close()
+
+
+class TestAuthenticatedHandshake(unittest.TestCase):
+    """Mutual identity authentication (SIGMA-style) over the key exchange."""
+
+    def _run(self, client_kwargs, server_kwargs):
+        s1, s2 = socket.socketpair()
+        s1.settimeout(5)
+        s2.settimeout(5)
+        out = {}
+
+        def server_side():
+            try:
+                out["conn"] = server_handshake(s2, **server_kwargs)
+            except Exception as e:  # noqa: BLE001
+                out["error"] = e
+
+        t = threading.Thread(target=server_side)
+        t.start()
+        try:
+            client_conn = client_handshake(s1, "client", **client_kwargs)
+            t.join(timeout=5)
+            out["client"] = client_conn
+        except Exception as e:  # noqa: BLE001
+            out["client_error"] = e
+            t.join(timeout=5)
+        finally:
+            pass
+        return out, (s1, s2)
+
+    def test_mutual_identity_success_and_pinning(self):
+        from matrix.identity import IdentityKey, PeerTrustStore
+
+        client_id = IdentityKey.generate()
+        server_id = IdentityKey.generate()
+        client_store = PeerTrustStore(tofu=True)
+        server_store = PeerTrustStore(tofu=True)
+
+        out, socks = self._run(
+            client_kwargs=dict(
+                identity=client_id, trust_store=client_store,
+                expected_peer="server", require_peer_identity=True),
+            server_kwargs=dict(
+                identity=server_id, trust_store=server_store,
+                require_peer_identity=True),
+        )
+        try:
+            self.assertNotIn("error", out, f"server: {out.get('error')}")
+            self.assertNotIn("client_error", out, f"client: {out.get('client_error')}")
+            # Both identities were pinned during the exchange.
+            self.assertEqual(client_store.get("server"), server_id.public_bytes)
+            self.assertEqual(server_store.get("client"), client_id.public_bytes)
+            # Encrypted channel works end to end.
+            out["client"].send(MsgType.SESSION_DATA, b"ping")
+            self.assertEqual(out["conn"].recv()[1], b"ping")
+            out["client"].close()
+            out["conn"].close()
+        finally:
+            socks[0].close()
+            socks[1].close()
+
+    def test_require_server_identity_but_none_offered(self):
+        out, socks = self._run(
+            client_kwargs=dict(require_peer_identity=True),
+            server_kwargs=dict(),  # server has no identity
+        )
+        try:
+            self.assertIn("client_error", out)
+            self.assertIsInstance(out["client_error"], ProtocolError)
+        finally:
+            socks[0].close()
+            socks[1].close()
+
+    def test_pinned_server_key_mismatch_rejected(self):
+        from matrix.identity import IdentityKey, PeerTrustStore
+
+        server_id = IdentityKey.generate()
+        attacker_id = IdentityKey.generate()
+        # Client has already pinned a DIFFERENT key for "server".
+        client_store = PeerTrustStore(tofu=True)
+        client_store.pin("server", attacker_id.public_bytes)
+
+        out, socks = self._run(
+            client_kwargs=dict(trust_store=client_store, expected_peer="server",
+                               require_peer_identity=True),
+            server_kwargs=dict(identity=server_id),
+        )
+        try:
+            self.assertIn("client_error", out)
+            self.assertIsInstance(out["client_error"], ProtocolError)
+            self.assertIn("not trusted", str(out["client_error"]))
+        finally:
+            socks[0].close()
+            socks[1].close()
+
+    def test_mitm_substituted_ephemeral_rejected(self):
+        """A signature over a different ephemeral than the one delivered fails.
+
+        Simulates an active MITM that forwards a server identity signature but
+        swaps the ephemeral key — the transcript binding must reject it.
+        """
+        from matrix.identity import IdentityKey
+        from matrix.jump_protocol import (
+            generate_keypair, _handshake_transcript, PROTOCOL_VERSION,
+            recv_frame_from, send_frame_to,
+        )
+        import json as _json
+
+        server_id = IdentityKey.generate()
+        s1, s2 = socket.socketpair()
+        s1.settimeout(5)
+        s2.settimeout(5)
+        b2 = DirectTCPBackend(s2)
+
+        def malicious_server():
+            # HELLO
+            recv_frame_from(b2)
+            send_frame_to(b2, MsgType.HELLO_ACK, _json.dumps(
+                {"version": PROTOCOL_VERSION, "status": "ok", "resumed": False}
+            ).encode())
+            # KEY_EXCHANGE from client
+            _, _, kx = recv_frame_from(b2)
+            client_eph = bytes.fromhex(_json.loads(kx.decode())["public_key"])
+            # Honestly sign over a transcript, but DELIVER a different ephemeral.
+            _, signed_eph = generate_keypair()
+            _, delivered_eph = generate_keypair()
+            transcript = _handshake_transcript(client_eph, signed_eph,
+                                               PROTOCOL_VERSION)
+            resp = {
+                "public_key": delivered_eph.hex(),   # != signed_eph
+                "connection_id": "x",
+                "auth_required": False,
+                "require_peer_identity": False,
+                "identity_pub": server_id.public_bytes.hex(),
+                "identity_sig": server_id.sign(b"server-id" + transcript).hex(),
+            }
+            send_frame_to(b2, MsgType.KEY_EXCHANGE_ACK,
+                          _json.dumps(resp).encode())
+
+        t = threading.Thread(target=malicious_server)
+        t.start()
+        try:
+            with self.assertRaises(ProtocolError):
+                client_handshake(s1, "client", require_peer_identity=True)
+            t.join(timeout=5)
+        finally:
+            s1.close()
+            s2.close()
+
+
+class TestListenerBindHardening(unittest.TestCase):
+    """An unauthenticated listener must not bind a public interface."""
+
+    def test_public_bind_without_auth_refused(self):
+        listener = JumpListener(host="0.0.0.0", port=0)
+        with self.assertRaises(PermissionError):
+            listener.start()
+
+    def test_public_bind_with_auth_allowed(self):
+        listener = JumpListener(host="0.0.0.0", port=0,
+                                auth_validator=lambda t: True)
+        try:
+            listener.start()  # Must not raise.
+        finally:
+            listener.stop()
+
+    def test_loopback_bind_without_auth_allowed(self):
+        listener = JumpListener(host="127.0.0.1", port=0)
+        try:
+            listener.start()  # Local-only is fine without auth.
+        finally:
+            listener.stop()
+
+
+if __name__ == "__main__":
+    unittest.main()
