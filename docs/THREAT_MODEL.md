@@ -48,7 +48,7 @@ Trust boundaries:
 | **Repudiation** | Deny actions | Director audit log; RBAC | Partial |
 | **Information disclosure** | Eavesdrop; cleartext token | Ratcheted AES-256-GCM only (no fallback), deterministic counter nonces; token only sent inside encrypted channel; initiator identity sent encrypted (SIGMA-I) | Implemented |
 | **DoS** | Connection/resource exhaustion | Listener connection semaphore; payload caps; auth timeout | Partial |
-| **Elevation of privilege** | Unauthorized jump | RBAC + token + (optional) required peer identity | Implemented |
+| **Elevation of privilege** | Unauthorized jump; autonomous code upgrade/termination | RBAC + token + (optional) required peer identity; Director containment policy (advisory/disabled) | Implemented |
 | **Downgrade** | Force weaker suite/version | Suite + version bound into the signed transcript | Implemented |
 | **Replay** | Re-send captured frames | Nonce/replay tracking; fresh ephemerals per session | Partial |
 
@@ -97,8 +97,14 @@ These are deliberately tracked, not yet closed:
    allowlist mode (`tofu=False`, pre-provisioned keys) for high assurance.
 5. **No formal verification / external audit.** Model the handshake in
    Tamarin/ProVerif; commission a third-party crypto review.
-6. **AI Director attack surface.** Tool execution / code-upgrade proposals
-   should be advisory-only or compiled out for hardened builds.
+6. ~~**AI Director attack surface.**~~ *Mitigated:* a `ContainmentPolicy` bounds
+   the AI tier — `unrestricted` (legacy default), `restricted` (no code upgrade
+   or termination, directly or via `submit_task`), `advisory` (LLM consulted,
+   actions only recorded as recommendations, nothing executed), and `disabled`
+   (AI tier inert, LLM never invoked). High-assurance deployments set
+   `MATRIX_DIRECTOR_CONTAINMENT=advisory` or `disabled`. *Residual:* the default
+   is still `unrestricted` for backward compatibility — make it `advisory` for a
+   hardened build.
 7. **Incomplete transports.** Dead-drop backend is a placeholder; HTTPS probe is
    reachability-only. Claims must match validated code.
 8. **Supply chain.** Add SBOM, pinned hashes, reproducible builds, signed
@@ -112,3 +118,5 @@ These are deliberately tracked, not yet closed:
 - For classified-adjacent use, run the trust store in allowlist mode
   (`MATRIX_TOFU=false`) with pre-provisioned peer keys, and keep identity keys in
   hardware.
+- Run the Director under `MATRIX_DIRECTOR_CONTAINMENT=advisory` (or `disabled`)
+  so the AI tier can never autonomously modify running code or terminate nodes.

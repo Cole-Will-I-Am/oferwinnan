@@ -86,6 +86,8 @@ class MatrixConfig:
     director_degraded_sustain_s: float = _env("MATRIX_DEGRADED_SUSTAIN", 10.0, float)
     director_task_failure_window: float = _env("MATRIX_TASK_FAILURE_WINDOW", 120.0, float)
     director_task_failure_threshold: int = _env("MATRIX_TASK_FAILURE_THRESHOLD", 5, int)
+    # AI containment: unrestricted | restricted | advisory | disabled
+    director_containment: str = _env("MATRIX_DIRECTOR_CONTAINMENT", "unrestricted")
 
 
 config = MatrixConfig()

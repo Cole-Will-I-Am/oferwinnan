@@ -26,6 +26,7 @@ from matrix.director import (
     AuditEntry,
     EscalationDetector,
     ToolExecutor,
+    ContainmentPolicy,
     TriStateDirector,
     DIRECTOR_SYSTEM_PROMPT,
 )
@@ -423,6 +424,119 @@ class TestToolExecutor(unittest.TestCase):
         result = executor.execute(tc)
         self.assertTrue(result.success)
         mock_sync._rate_limiter.set_rate.assert_called_once_with(8192.0)
+
+
+# ── Containment Policy ──────────────────────────────────────────────────────
+
+
+class TestContainmentPolicy(unittest.TestCase):
+    def test_presets(self):
+        unr = ContainmentPolicy.unrestricted()
+        self.assertTrue(unr.invoke_llm and unr.execute_tools)
+        self.assertTrue(unr.allow_code_upgrade and unr.allow_termination)
+        self.assertIn("propose_hot_upgrade", unr.allowed_tools)
+
+        res = ContainmentPolicy.restricted()
+        self.assertTrue(res.invoke_llm and res.execute_tools)
+        self.assertFalse(res.allow_code_upgrade or res.allow_termination)
+        self.assertNotIn("propose_hot_upgrade", res.allowed_tools)
+        self.assertNotIn("terminate_node", res.allowed_tools)
+
+        adv = ContainmentPolicy.advisory()
+        self.assertTrue(adv.invoke_llm)
+        self.assertFalse(adv.execute_tools)
+
+        dis = ContainmentPolicy.disabled()
+        self.assertFalse(dis.invoke_llm or dis.execute_tools)
+        self.assertEqual(len(dis.allowed_tools), 0)
+
+    def test_from_name_and_unknown(self):
+        self.assertEqual(ContainmentPolicy.from_name("advisory").mode, "advisory")
+        self.assertEqual(ContainmentPolicy.from_name(None).mode, "unrestricted")
+        with self.assertRaises(DirectorError):
+            ContainmentPolicy.from_name("nope")
+
+
+class TestToolExecutorContainment(unittest.TestCase):
+    def test_tool_definitions_filtered_by_policy(self):
+        self.assertEqual(len(ToolExecutor.tool_definitions()), 7)
+        self.assertEqual(
+            len(ToolExecutor.tool_definitions(ContainmentPolicy.restricted())), 5)
+        self.assertEqual(
+            len(ToolExecutor.tool_definitions(ContainmentPolicy.disabled())), 0)
+
+    def test_restricted_blocks_code_upgrade(self):
+        ex = ToolExecutor(policy=ContainmentPolicy.restricted())
+        r = ex.execute(LLMToolCall(tool_name="propose_hot_upgrade",
+                                   arguments={"code": "x=1", "target": "m"}))
+        self.assertFalse(r.success)
+        self.assertIn("containment", r.error)
+
+    def test_restricted_blocks_termination(self):
+        ex = ToolExecutor(policy=ContainmentPolicy.restricted())
+        r = ex.execute(LLMToolCall(tool_name="terminate_node",
+                                   arguments={"target": "node-1"}))
+        self.assertFalse(r.success)
+        self.assertIn("containment", r.error)
+
+    def test_restricted_blocks_submit_task_indirection(self):
+        ex = ToolExecutor(policy=ContainmentPolicy.restricted())
+        for dangerous in ("upgrade", "terminate"):
+            r = ex.execute(LLMToolCall(
+                tool_name="submit_task",
+                arguments={"task_type": dangerous, "target": "n"}))
+            self.assertFalse(r.success)
+            self.assertIn("containment", r.error)
+
+    def test_restricted_allows_safe_tool_through_to_handler(self):
+        ex = ToolExecutor(policy=ContainmentPolicy.restricted())
+        # Allowed by policy, then fails for lack of a NodeManager (not policy).
+        r = ex.execute(LLMToolCall(
+            tool_name="submit_task",
+            arguments={"task_type": "discover", "target": "n"}))
+        self.assertFalse(r.success)
+        self.assertNotIn("containment", r.error)
+
+
+class TestDirectorContainmentModes(unittest.TestCase):
+    def test_advisory_records_but_does_not_execute(self):
+        loop, _, _ = _make_loop()
+        mock_llm = _MockLLM(tool_calls=[
+            LLMToolCall(tool_name="terminate_node", arguments={"target": "n"}),
+        ])
+        director = TriStateDirector(loop, llm_backend=mock_llm,
+                                    policy=ContainmentPolicy.advisory())
+        director.start()
+        try:
+            director.manual_escalate(reason="advisory-test")
+            time.sleep(0.5)
+        finally:
+            director.stop()
+
+        self.assertGreaterEqual(mock_llm.invoke_count, 1)
+        cats = [e.category for e in director.audit_log]
+        self.assertIn("recommendation", cats)
+        self.assertNotIn("tool_call", cats)  # nothing executed
+        self.assertEqual(director.state, DirectorState.AUTONOMOUS)
+
+    def test_disabled_never_invokes_llm(self):
+        loop, _, _ = _make_loop()
+        mock_llm = _MockLLM(tool_calls=[
+            LLMToolCall(tool_name="trigger_discovery", arguments={}),
+        ])
+        director = TriStateDirector(loop, llm_backend=mock_llm,
+                                    policy=ContainmentPolicy.disabled())
+        director.start()
+        try:
+            director.manual_escalate(reason="disabled-test")
+            time.sleep(0.5)
+        finally:
+            director.stop()
+
+        self.assertEqual(mock_llm.invoke_count, 0)
+        cats = [e.category for e in director.audit_log]
+        self.assertIn("containment_blocked", cats)
+        self.assertEqual(director.state, DirectorState.AUTONOMOUS)
 
 
 # ── TriStateDirector — State Machine ────────────────────────────────────────

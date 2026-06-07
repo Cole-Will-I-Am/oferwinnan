@@ -141,6 +141,7 @@ cp .env.example .env
 | `MATRIX_DEGRADED_SUSTAIN` | `10.0` | Sustained degradation before escalation (seconds) |
 | `MATRIX_TASK_FAILURE_WINDOW` | `120.0` | Task failure rate window (seconds) |
 | `MATRIX_TASK_FAILURE_THRESHOLD` | `5` | Failures in window to trigger escalation |
+| `MATRIX_DIRECTOR_CONTAINMENT` | `unrestricted` | AI containment: `unrestricted`, `restricted`, `advisory`, or `disabled` |
 
 ## Running as a Service
 
@@ -181,6 +182,21 @@ The Tri-State Director adds LLM-augmented orchestration with three tiers of auth
 Escalation triggers: fallback exhaustion, all-paths-degraded (sustained), task failure rate, transport total failure, manual. All triggers use hysteresis (cooldown + sustain windows) to prevent flapping.
 
 Safety constraints: action budget (default 5), dead-man's switch timeout, AST quarantine on all proposed code (blocks `os`/`subprocess`/`eval`/`exec`/`open`), rollback on any failure, full audit trail.
+
+**Containment policy** (`--containment` / `MATRIX_DIRECTOR_CONTAINMENT`) bounds what the AI tier may do:
+
+| Mode | LLM consulted | Tools executed | Code upgrade / terminate |
+|---|---|---|---|
+| `unrestricted` (default) | yes | yes | allowed |
+| `restricted` | yes | yes | **blocked** (incl. via `submit_task`) |
+| `advisory` | yes | no — actions recorded as recommendations | **blocked** |
+| `disabled` | no | no | **blocked** |
+
+For high-assurance deployments run `advisory` or `disabled` so the AI can never autonomously modify running code or terminate nodes:
+
+```bash
+matrix director start --containment advisory
+```
 
 ## Security
 

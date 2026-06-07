@@ -411,7 +411,15 @@ def main():
     # director
     p_director = sub.add_parser("director", help="Tri-State Director controls")
     director_sub = p_director.add_subparsers(dest="director_command", required=True)
-    director_sub.add_parser("start", help="Start director alongside listener")
+    p_director_start = director_sub.add_parser(
+        "start", help="Start director alongside listener")
+    p_director_start.add_argument(
+        "--containment",
+        choices=["unrestricted", "restricted", "advisory", "disabled"],
+        default=_config.director_containment,
+        help="Bound the AI tier (default: MATRIX_DIRECTOR_CONTAINMENT). "
+             "advisory/disabled prevent autonomous code upgrade and termination.",
+    )
     director_sub.add_parser("status", help="Show director state")
     director_sub.add_parser("override", help="Human takes direct control")
     director_sub.add_parser("release", help="Release human override")
@@ -505,7 +513,7 @@ def _director_start(args):
 
     from matrix.mirror_blend import MirrorRegistry, Blender
     from matrix.autonomous import AutonomousLoop, system_metrics
-    from matrix.director import TriStateDirector
+    from matrix.director import TriStateDirector, ContainmentPolicy
 
     registry = MirrorRegistry()
     blender = Blender(registry)
@@ -513,10 +521,14 @@ def _director_start(args):
     loop.add_metrics_collector(system_metrics)
     loop.start()
 
-    _director_instance = TriStateDirector(loop)
+    policy = ContainmentPolicy.from_name(
+        getattr(args, "containment", None) or _config.director_containment
+    )
+    _director_instance = TriStateDirector(loop, policy=policy)
     _director_instance.start()
 
-    logger.info("Director started.  State: %s", _director_instance.state.value)
+    logger.info("Director started.  State: %s  Containment: %s",
+                _director_instance.state.value, policy.mode)
     logger.info("Press Ctrl+C to stop.")
     try:
         while True:

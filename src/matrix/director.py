@@ -45,6 +45,7 @@ __all__ = [
     "AuditEntry",
     "EscalationDetector",
     "ToolExecutor",
+    "ContainmentPolicy",
     "TriStateDirector",
     "DirectorError",
     "DIRECTOR_SYSTEM_PROMPT",
@@ -164,6 +165,83 @@ class AuditEntry:
     details: Dict[str, Any] = field(default_factory=dict)
 
 
+# ── Containment Policy ───────────────────────────────────────────────────────
+
+# Tools that can alter running code or destroy nodes — the high-risk surface.
+_CODE_UPGRADE_TOOL = "propose_hot_upgrade"
+_TERMINATION_TOOL = "terminate_node"
+
+_ALL_TOOLS = frozenset({
+    "set_routing_weights", "force_session_jump", "propose_hot_upgrade",
+    "adjust_rate_limit", "trigger_discovery", "terminate_node", "submit_task",
+})
+# Reversible / operational tools only — no in-process code upgrade, no terminate.
+_SAFE_TOOLS = frozenset({
+    "set_routing_weights", "force_session_jump", "adjust_rate_limit",
+    "trigger_discovery", "submit_task",
+})
+
+
+@dataclass(frozen=True, slots=True)
+class ContainmentPolicy:
+    """Bounds what the AI (Tier 2) is permitted to do during an escalation.
+
+    Modes (least → most restrictive):
+      - ``unrestricted`` : every tool may be executed (default; legacy behavior).
+      - ``restricted``   : only reversible/operational tools; no code upgrade and
+                           no node termination (directly or via ``submit_task``).
+      - ``advisory``     : the LLM is consulted and its proposed actions are
+                           recorded as recommendations, but nothing is executed.
+      - ``disabled``     : the AI tier is inert — escalations never invoke the
+                           LLM and no tools run.
+
+    High-assurance deployments should run ``advisory`` or ``disabled`` so that no
+    autonomous code modification or termination is ever possible.
+    """
+
+    mode: str
+    allowed_tools: frozenset
+    allow_code_upgrade: bool
+    allow_termination: bool
+    execute_tools: bool
+    invoke_llm: bool
+
+    @classmethod
+    def unrestricted(cls) -> "ContainmentPolicy":
+        return cls("unrestricted", _ALL_TOOLS, True, True, True, True)
+
+    @classmethod
+    def restricted(cls) -> "ContainmentPolicy":
+        return cls("restricted", _SAFE_TOOLS, False, False, True, True)
+
+    @classmethod
+    def advisory(cls) -> "ContainmentPolicy":
+        return cls("advisory", _ALL_TOOLS, False, False, False, True)
+
+    @classmethod
+    def disabled(cls) -> "ContainmentPolicy":
+        return cls("disabled", frozenset(), False, False, False, False)
+
+    @classmethod
+    def from_name(cls, name: str) -> "ContainmentPolicy":
+        presets = {
+            "unrestricted": cls.unrestricted,
+            "restricted": cls.restricted,
+            "advisory": cls.advisory,
+            "disabled": cls.disabled,
+        }
+        try:
+            return presets[(name or "unrestricted").lower()]()
+        except KeyError:
+            raise DirectorError(
+                f"Unknown containment mode {name!r}; expected one of "
+                f"{sorted(presets)}"
+            )
+
+    def permits(self, tool_name: str) -> bool:
+        return tool_name in self.allowed_tools
+
+
 # ── System Prompt ────────────────────────────────────────────────────────────
 
 
@@ -210,7 +288,10 @@ class EscalationDetector:
         self._task_failure_threshold = task_failure_threshold
 
         self._lock = threading.Lock()
-        self._last_escalation: float = 0.0
+        # None = never escalated. Must NOT default to 0.0: it is compared against
+        # time.monotonic() (seconds since boot), so on a freshly-booted host with
+        # uptime < cooldown the first escalation would be wrongly suppressed.
+        self._last_escalation: Optional[float] = None
         self._degraded_since: Optional[float] = None
         self._task_failures: List[float] = []
         self._on_escalation: Optional[Callable[[EscalationEvent], None]] = None
@@ -247,7 +328,8 @@ class EscalationDetector:
         """
         with self._lock:
             now = time.monotonic()
-            if now - self._last_escalation < self._cooldown_s:
+            if (self._last_escalation is not None
+                    and now - self._last_escalation < self._cooldown_s):
                 return None
 
             event = self._check_fallbacks_exhausted()
@@ -275,7 +357,8 @@ class EscalationDetector:
         """Called by TransportNegotiator when all probes fail."""
         with self._lock:
             now = time.monotonic()
-            if now - self._last_escalation < self._cooldown_s:
+            if (self._last_escalation is not None
+                    and now - self._last_escalation < self._cooldown_s):
                 return
             event = EscalationEvent(
                 event_id=uuid.uuid4().hex,
@@ -300,7 +383,7 @@ class EscalationDetector:
             if (
                 slot.attempt >= len(slot.fallbacks) - 1
                 and slot.failure_count > 0
-                and slot.last_failure > self._last_escalation
+                and slot.last_failure > (self._last_escalation or 0.0)
             ):
                 return EscalationEvent(
                     event_id=uuid.uuid4().hex,
@@ -374,6 +457,7 @@ class ToolExecutor:
         terminator: Any = None,
         rbac: Any = None,
         auth_token: str = "",
+        policy: Optional["ContainmentPolicy"] = None,
     ):
         self._node = node
         self._multipath = multipath
@@ -383,6 +467,7 @@ class ToolExecutor:
         self._terminator = terminator
         self._rbac = rbac
         self._auth_token = auth_token
+        self._policy = policy or ContainmentPolicy.unrestricted()
 
         self._handlers: Dict[str, Callable[..., Any]] = {
             "set_routing_weights": self._set_routing_weights,
@@ -397,9 +482,16 @@ class ToolExecutor:
     # -- Tool Schema --
 
     @staticmethod
-    def tool_definitions() -> List[ToolDefinition]:
-        """Return the fixed set of tools the LLM may invoke."""
-        return [
+    def tool_definitions(
+        policy: Optional["ContainmentPolicy"] = None,
+    ) -> List[ToolDefinition]:
+        """Return the tools the LLM may invoke, filtered by containment policy.
+
+        With no policy (default) all tools are returned. When a policy is given,
+        only its ``allowed_tools`` are advertised so the LLM is never offered a
+        blocked capability.
+        """
+        defs = [
             ToolDefinition(
                 name="set_routing_weights",
                 description=(
@@ -507,12 +599,39 @@ class ToolExecutor:
                 },
             ),
         ]
+        if policy is not None:
+            defs = [d for d in defs if d.name in policy.allowed_tools]
+        return defs
 
     # -- Dispatch --
+
+    def _policy_block_reason(self, tool_call: LLMToolCall) -> Optional[str]:
+        """Return a reason string if the containment policy forbids this call."""
+        name = tool_call.tool_name
+        if name in self._handlers and not self._policy.permits(name):
+            return (f"Tool '{name}' blocked by containment policy "
+                    f"'{self._policy.mode}'")
+        # Block dangerous indirection through submit_task task types.
+        if name == "submit_task":
+            task_type = (tool_call.arguments or {}).get("task_type")
+            if task_type == "upgrade" and not self._policy.allow_code_upgrade:
+                return "submit_task(upgrade) blocked by containment policy"
+            if task_type == "terminate" and not self._policy.allow_termination:
+                return "submit_task(terminate) blocked by containment policy"
+        return None
 
     def execute(self, tool_call: LLMToolCall) -> ToolResult:
         """Execute a single tool call.  Returns ToolResult."""
         t0 = time.monotonic()
+        blocked = self._policy_block_reason(tool_call)
+        if blocked:
+            return ToolResult(
+                tool_name=tool_call.tool_name,
+                arguments=tool_call.arguments,
+                success=False,
+                error=blocked,
+                duration_ms=(time.monotonic() - t0) * 1000,
+            )
         handler = self._handlers.get(tool_call.tool_name)
         if handler is None:
             return ToolResult(
@@ -678,8 +797,14 @@ class TriStateDirector:
         terminator: Any = None,
         llm_backend: Optional[LLMBackend] = None,
         config: Any = None,
+        policy: Optional[ContainmentPolicy] = None,
     ):
         cfg = config or _config
+
+        # Containment policy bounds the AI tier (see ContainmentPolicy).
+        self._policy = policy or ContainmentPolicy.from_name(
+            getattr(cfg, "director_containment", "unrestricted")
+        )
 
         self._loop = loop
         self._node = node
@@ -751,6 +876,7 @@ class TriStateDirector:
             terminator=terminator,
             rbac=rbac,
             auth_token=self._auth_token,
+            policy=self._policy,
         )
 
         # ── Audit log ────────────────────────────────────────────────────
@@ -779,7 +905,8 @@ class TriStateDirector:
             name="director-escalation",
         )
         self._escalation_thread.start()
-        logger.info("TriStateDirector: started in AUTONOMOUS state")
+        logger.info("TriStateDirector: started in AUTONOMOUS state "
+                    "(containment=%s)", self._policy.mode)
 
     def stop(self) -> None:
         """Stop the director."""
@@ -917,6 +1044,24 @@ class TriStateDirector:
     def _handle_escalation(self, event: EscalationEvent) -> None:
         """Process a single escalation: AI_ACTIVE → tool execution → AUTONOMOUS."""
 
+        # Containment: a disabled AI tier never invokes the LLM or runs tools.
+        if not self._policy.invoke_llm:
+            self._audit(
+                "containment_blocked",
+                self._state.value,
+                self._state.value,
+                {
+                    "trigger": event.trigger.value,
+                    "mode": self._policy.mode,
+                    "note": "AI tier disabled by containment policy",
+                },
+            )
+            logger.info(
+                "Director: escalation %s not actioned (containment=%s)",
+                event.trigger.value, self._policy.mode,
+            )
+            return
+
         # 1. Transition to AI_ACTIVE
         self._transition(
             DirectorState.AI_ACTIVE,
@@ -931,6 +1076,21 @@ class TriStateDirector:
         upgrade_versions: List[Optional[int]] = []
         try:
             response = self._invoke_llm(delta)
+
+            if not self._policy.execute_tools:
+                # Advisory mode: record the LLM's proposed actions; execute none.
+                for tool_call in response.tool_calls:
+                    self._audit("recommendation", "ai_active", "ai_active", {
+                        "tool": tool_call.tool_name,
+                        "arguments": tool_call.arguments,
+                        "executed": False,
+                        "mode": self._policy.mode,
+                    })
+                logger.info(
+                    "Director: advisory mode recorded %d recommendation(s)",
+                    len(response.tool_calls),
+                )
+                return
 
             actions_taken = 0
             for tool_call in response.tool_calls:
@@ -1086,7 +1246,7 @@ class TriStateDirector:
             action_budget=self._action_budget,
         )
         user_message = delta.to_json()
-        tools = ToolExecutor.tool_definitions()
+        tools = ToolExecutor.tool_definitions(self._policy)
 
         response = self._llm.invoke(
             system_prompt=system_prompt,
@@ -1140,6 +1300,7 @@ class TriStateDirector:
             queue_depth = len(self._escalation_queue)
         return {
             "state": state,
+            "containment": self._policy.mode,
             "audit_entries": len(self._audit_log),
             "escalation_queue_depth": queue_depth,
             "action_budget": self._action_budget,
