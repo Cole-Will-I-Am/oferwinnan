@@ -43,12 +43,17 @@ from matrix.config import config as _config
 MAX_PAYLOAD = _config.max_payload     # 16 MiB per frame
 CHUNK_SIZE = _config.chunk_size       # 64 KiB transfer chunks
 
+# Seconds to wait for the encrypted AUTH exchange after key agreement.
+AUTH_TIMEOUT = 30.0
+
 
 class MsgType(IntEnum):
     HELLO = 0x01
     HELLO_ACK = 0x02
     KEY_EXCHANGE = 0x10
     KEY_EXCHANGE_ACK = 0x11
+    AUTH = 0x12              # Encrypted post-handshake authentication
+    AUTH_OK = 0x13           # Authentication accepted
     SESSION_DATA = 0x20
     SESSION_ACK = 0x21
     RESUME = 0x22            # NEW: resume a transfer from a given offset
@@ -604,7 +609,10 @@ class SessionKeyCache:
 
     def store(self, keys: SessionKeys) -> None:
         with self._lock:
-            self._cache[keys.connection_id] = (keys, time.monotonic())
+            # Snapshot the keys so live session traffic cannot mutate the cached
+            # ratchet state. Both peers must resume from an identical point for
+            # the post-handshake encrypted AUTH exchange to stay in sync.
+            self._cache[keys.connection_id] = (keys.clone(), time.monotonic())
             self._evict()
 
     def get(self, connection_id: str) -> Optional[SessionKeys]:
@@ -640,16 +648,18 @@ def client_handshake(backend, node_id: str,
 
     Accepts a socket.socket or TransportBackend.
     If connection_id is provided, attempts 0-RTT resumption.
+
+    The auth token is never placed on the wire in cleartext: authentication
+    happens over the encrypted channel after key agreement (AUTH/AUTH_OK).
     """
     backend = _wrap_backend(backend)
     conn_id = connection_id or ""
 
-    # Send HELLO
+    # Send HELLO (no auth token — authentication is post-handshake & encrypted)
     hello = json.dumps({
         "node_id": node_id,
         "version": PROTOCOL_VERSION,
         "connection_id": conn_id,
-        "auth_token": auth_token or "",
     }).encode()
     send_frame_to(backend, MsgType.HELLO, hello)
 
@@ -665,17 +675,18 @@ def client_handshake(backend, node_id: str,
     # Check for 0-RTT resumption
     if ack_info.get("resumed") and conn_id:
         cached = _key_cache.get(conn_id)
-        if cached:
-            return JumpConnection(backend, cached, is_initiator=True)
-        raise ProtocolError(
-            "Server accepted session resumption, but no local session keys are cached"
-        )
+        if not cached:
+            raise ProtocolError(
+                "Server accepted session resumption, but no local session keys are cached"
+            )
+        conn = JumpConnection(backend, cached, is_initiator=True)
+        _client_authenticate(conn, auth_token, ack_info.get("auth_required"))
+        return conn
 
-    # Full key exchange
+    # Full key exchange (no auth token on the wire)
     private_key, pub_bytes = generate_keypair()
     kx_payload = json.dumps({
         "public_key": pub_bytes.hex(),
-        "auth_token": auth_token or "",
     }).encode()
     send_frame_to(backend, MsgType.KEY_EXCHANGE, kx_payload)
 
@@ -692,7 +703,33 @@ def client_handshake(backend, node_id: str,
     keys = derive_session_keys(private_key, peer_pub, connection_id=new_conn_id,
                                is_initiator=True)
     _key_cache.store(keys)
-    return JumpConnection(backend, keys, is_initiator=True)
+    conn = JumpConnection(backend, keys, is_initiator=True)
+
+    # Authenticate over the encrypted channel before any session traffic.
+    _client_authenticate(conn, auth_token, peer_info.get("auth_required"))
+    return conn
+
+
+def _client_authenticate(conn: JumpConnection, auth_token: Optional[str],
+                         auth_required) -> None:
+    """Send the auth token over the encrypted channel and await AUTH_OK.
+
+    No-op when the server did not request authentication.
+    """
+    if not auth_required:
+        return
+    conn.send(MsgType.AUTH, json.dumps({"auth_token": auth_token or ""}).encode())
+    try:
+        msg_type, payload = conn.recv(timeout=AUTH_TIMEOUT)
+    except (TimeoutError, ConnectionError) as e:
+        raise ProtocolError(f"No authentication response: {e}") from e
+    if msg_type == MsgType.AUTH_OK:
+        return
+    if msg_type == MsgType.ERROR:
+        raise ProtocolError(
+            f"Authentication failed: {payload.decode(errors='replace')}"
+        )
+    raise ProtocolError(f"Expected AUTH_OK, got {msg_type}")
 
 
 def server_handshake(backend,
@@ -702,9 +739,14 @@ def server_handshake(backend,
     """Perform a server-side handshake: receive HELLO -> KEY_EXCHANGE -> done.
 
     Accepts a socket.socket or TransportBackend.
+
+    When an auth_validator is supplied, the client must authenticate over the
+    encrypted channel (AUTH/AUTH_OK) after key agreement; the token is never
+    accepted in cleartext, including on the 0-RTT resumption path.
     """
     backend = _wrap_backend(backend)
     cache = key_cache or _key_cache
+    auth_required = auth_validator is not None
 
     # Receive HELLO
     msg_type, _, payload = recv_frame_from(backend)
@@ -713,29 +755,24 @@ def server_handshake(backend,
 
     hello_info = json.loads(payload.decode())
     requested_conn_id = hello_info.get("connection_id", "")
-    hello_auth_token = hello_info.get("auth_token", "")
     peer_node_id = hello_info.get("node_id", "")
 
     # Attempt 0-RTT resumption
     if requested_conn_id:
         cached = cache.get(requested_conn_id)
         if cached:
-            if auth_validator:
-                # Resume must be authenticated before skipping key exchange.
-                if not hello_auth_token:
-                    cached = None
-                elif not auth_validator(hello_auth_token):
-                    send_frame_to(backend, MsgType.ERROR, b"Authentication failed")
-                    raise ProtocolError("Authentication failed")
-        if cached:
             ack = json.dumps({
                 "version": PROTOCOL_VERSION,
                 "status": "ok",
                 "resumed": True,
+                "auth_required": auth_required,
             }).encode()
             send_frame_to(backend, MsgType.HELLO_ACK, ack)
-            return JumpConnection(backend, cached, is_initiator=False,
+            conn = JumpConnection(backend, cached, is_initiator=False,
                                   peer_node_id=peer_node_id)
+            # Resumption still authenticates over the encrypted channel.
+            _server_authenticate(conn, auth_validator)
+            return conn
 
     # Normal handshake
     ack = json.dumps({
@@ -745,17 +782,11 @@ def server_handshake(backend,
     }).encode()
     send_frame_to(backend, MsgType.HELLO_ACK, ack)
 
-    # Receive KEY_EXCHANGE
+    # Receive KEY_EXCHANGE (no auth token on the wire)
     msg_type, _, kx_payload = recv_frame_from(backend)
     if msg_type != MsgType.KEY_EXCHANGE:
         raise ProtocolError(f"Expected KEY_EXCHANGE, got {msg_type}")
     kx_info = json.loads(kx_payload.decode())
-
-    # Validate auth token
-    if auth_validator and not auth_validator(kx_info.get("auth_token", "")):
-        send_frame_to(backend, MsgType.ERROR, b"Authentication failed")
-        raise ProtocolError("Authentication failed")
-
     peer_pub = bytes.fromhex(kx_info["public_key"])
 
     # Generate our keypair and respond
@@ -764,14 +795,53 @@ def server_handshake(backend,
     kx_resp = json.dumps({
         "public_key": pub_bytes.hex(),
         "connection_id": conn_id,
+        "auth_required": auth_required,
     }).encode()
     send_frame_to(backend, MsgType.KEY_EXCHANGE_ACK, kx_resp)
 
     keys = derive_session_keys(private_key, peer_pub, connection_id=conn_id,
                                is_initiator=False)
     cache.store(keys)
-    return JumpConnection(backend, keys, is_initiator=False,
+    conn = JumpConnection(backend, keys, is_initiator=False,
                           peer_node_id=peer_node_id)
+
+    # Authenticate over the encrypted channel before any session traffic.
+    _server_authenticate(conn, auth_validator)
+    return conn
+
+
+def _server_authenticate(conn: JumpConnection,
+                         auth_validator: Optional[Callable[[str], bool]]) -> None:
+    """Require an encrypted AUTH frame carrying a valid token, then AUTH_OK.
+
+    No-op when authentication is not configured.
+    """
+    if auth_validator is None:
+        return
+    try:
+        msg_type, payload = conn.recv(timeout=AUTH_TIMEOUT)
+    except (TimeoutError, ConnectionError) as e:
+        raise ProtocolError(f"Authentication not received: {e}") from e
+    if msg_type != MsgType.AUTH:
+        _try_send_error(conn, b"Authentication required")
+        raise ProtocolError(f"Expected AUTH, got {msg_type}")
+    try:
+        token = json.loads(payload.decode()).get("auth_token", "")
+    except (ValueError, UnicodeDecodeError) as e:
+        _try_send_error(conn, b"Malformed authentication")
+        raise ProtocolError(f"Malformed AUTH payload: {e}") from e
+    if not auth_validator(token):
+        _try_send_error(conn, b"Authentication failed")
+        raise ProtocolError("Authentication failed")
+    conn.send(MsgType.AUTH_OK, b"")
+
+
+def _try_send_error(conn: JumpConnection, message: bytes) -> None:
+    """Best-effort encrypted ERROR notification; never raises."""
+    try:
+        conn.send(MsgType.ERROR, message)
+    except (ConnectionError, OSError, ProtocolError):
+        pass
 
 
 # == Listener ==================================================================
@@ -797,7 +867,20 @@ class JumpListener:
         self._conn_semaphore = threading.Semaphore(max_connections)
         self._key_cache = SessionKeyCache(ttl=60.0)
 
+    @staticmethod
+    def _is_public_host(host: str) -> bool:
+        """True if binding `host` exposes the listener beyond loopback."""
+        return host not in ("127.0.0.1", "::1", "localhost")
+
     def start(self):
+        # Refuse to expose an unauthenticated listener on a public interface.
+        if self._is_public_host(self.host) and self.auth_validator is None:
+            raise PermissionError(
+                f"Refusing to start an unauthenticated listener on public address "
+                f"'{self.host}'. Set an auth token (MATRIX_AUTH_TOKEN or --token) "
+                f"to listen on a public interface, or bind to 127.0.0.1 for "
+                f"local-only use."
+            )
         self._server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._server_sock.bind((self.host, self.port))

@@ -149,6 +149,8 @@ sudo journalctl -u matrix -f
 
 The bundled unit runs with additional `systemd` hardening (`NoNewPrivileges`, `ProtectSystem`, capability drop, syscall/address-family restrictions) and starts listener mode with `--restore-files never` for non-interactive safety.
 
+> **Set `MATRIX_AUTH_TOKEN` in `/root/Matrix/.env`.** The listener binds all interfaces and now refuses to start unauthenticated on a public address, so a token is required for the service to come up (it also gates the encrypted `AUTH` handshake).
+
 ## Development
 
 ```bash
@@ -180,7 +182,8 @@ Safety constraints: action budget (default 5), dead-man's switch timeout, AST qu
 
 - **Forward secrecy**: Signal-spec symmetric ratchet (KDF_CK) with per-message AES-256-GCM keys
 - **Key exchange**: X25519 ECDH with HKDF-SHA256 derivation
-- **Authentication**: RBAC with constant-time token comparison
+- **Authentication**: encrypted post-handshake `AUTH`/`AUTH_OK` exchange — the token is never sent in cleartext (including on 0-RTT resume); RBAC with constant-time token comparison
+- **Safe binding**: an unauthenticated listener refuses to bind a public interface; set an auth token to listen beyond `127.0.0.1`
 - **Replay protection**: Nonce tracking with TTL expiry
 - **Traffic analysis resistance**: Frame padding, timing jitter, cover traffic, protocol mimicry
 - **Secure cleanup**: Chain key zeroization, state wiping on termination

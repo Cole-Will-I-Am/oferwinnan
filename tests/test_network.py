@@ -225,64 +225,79 @@ class TestBackendFrameIO(unittest.TestCase):
         sent_types = [decode_frame(frame)[0] for frame in backend.sent]
         self.assertEqual(sent_types, [MsgType.HELLO])
 
-    def test_resume_requires_valid_hello_auth(self):
-        """Server must not allow 0-RTT resumption without valid HELLO auth."""
+    def test_resume_authenticates_over_encrypted_channel(self):
+        """0-RTT resume must authenticate over the encrypted channel, never in cleartext.
 
-        class FakeBackend:
-            def __init__(self, incoming: bytes):
-                self._incoming = bytearray(incoming)
-                self.sent: list[bytes] = []
+        Drives a real handshake to populate both key caches, then verifies that
+        a resumed session is rejected with a bad token and accepted (and usable)
+        with the correct one.
+        """
+        token = "good-token"
 
-            def send_bytes(self, data: bytes) -> None:
-                self.sent.append(data)
+        def validator(t):
+            return t == token
 
-            def recv_bytes(self, n: int) -> bytes:
-                if len(self._incoming) < n:
-                    raise ConnectionError("eof")
-                out = bytes(self._incoming[:n])
-                del self._incoming[:n]
-                return out
-
-            def close(self) -> None:
-                pass
-
-            @property
-            def peer_address(self) -> str:
-                return "fake"
-
-            @property
-            def transport_name(self) -> str:
-                return "fake"
-
-            @property
-            def is_connected(self) -> bool:
-                return True
-
-        priv, pub = generate_keypair()
-        keys = derive_session_keys(priv, pub, connection_id="resume-auth-test")
         cache = SessionKeyCache(ttl=60.0)
-        cache.store(keys)
 
-        hello = encode_frame(
-            MsgType.HELLO,
-            json.dumps({
-                "node_id": "attacker",
-                "version": PROTOCOL_VERSION,
-                "connection_id": "resume-auth-test",
-                "auth_token": "bad-token",
-            }).encode(),
-        )
-        backend = FakeBackend(hello)
+        server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_sock.bind(("127.0.0.1", 0))
+        port = server_sock.getsockname()[1]
+        server_sock.listen(2)
 
-        with self.assertRaises(ProtocolError):
-            server_handshake(
-                backend,
-                auth_validator=lambda token: token == "good-token",
-                key_cache=cache,
-            )
+        out = {}
 
-        self.assertTrue(backend.sent)
-        self.assertEqual(decode_frame(backend.sent[0])[0], MsgType.ERROR)
+        def serve(key):
+            try:
+                client, _ = server_sock.accept()
+                out[key] = server_handshake(
+                    client, auth_validator=validator, key_cache=cache,
+                )
+            except Exception as e:  # noqa: BLE001
+                out[key] = e
+
+        try:
+            # 1) Full handshake populates client (global) and server caches.
+            t = threading.Thread(target=serve, args=("first",))
+            t.start()
+            c1 = socket.create_connection(("127.0.0.1", port))
+            conn1 = client_handshake(c1, "node", auth_token=token)
+            t.join(5)
+            self.assertIsInstance(out["first"], JumpConnection)
+            conn_id = conn1.connection_id
+            self.assertTrue(conn_id)
+
+            # 2) Resume with the WRONG token must be rejected on both ends.
+            t = threading.Thread(target=serve, args=("bad",))
+            t.start()
+            c2 = socket.create_connection(("127.0.0.1", port))
+            with self.assertRaises(ProtocolError):
+                client_handshake(c2, "node", auth_token="wrong",
+                                 connection_id=conn_id)
+            t.join(5)
+            self.assertIsInstance(out["bad"], ProtocolError)
+            c2.close()
+
+            # 3) Resume with the correct token succeeds and yields a usable conn.
+            t = threading.Thread(target=serve, args=("good",))
+            t.start()
+            c3 = socket.create_connection(("127.0.0.1", port))
+            conn3 = client_handshake(c3, "node", auth_token=token,
+                                     connection_id=conn_id)
+            t.join(5)
+            self.assertIsInstance(out["good"], JumpConnection)
+
+            conn3.send(MsgType.PING, b"resumed-hello")
+            msg_type, data = out["good"].recv()
+            self.assertEqual(msg_type, MsgType.PING)
+            self.assertEqual(data, b"resumed-hello")
+
+            conn3.close()
+            out["good"].close()
+            conn1.close()
+            out["first"].close()
+        finally:
+            server_sock.close()
 
 
 # == Protocol Version Compatibility ============================================

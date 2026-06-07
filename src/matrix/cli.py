@@ -18,6 +18,7 @@ import socket
 import sys
 import time
 
+from matrix.config import config as _config
 from matrix.device_discovery import Device, Transport, DiscoveryManager
 from matrix.session_jumper import (
     JumpNode, JumpSession, restore_session, JumpError,
@@ -74,7 +75,12 @@ def cmd_listen(args):
         auth_token=args.token,
         on_session_received=on_session,
     )
-    node.start()
+    try:
+        node.start()
+    except PermissionError as e:
+        logger.error(str(e))
+        node.stop()
+        sys.exit(1)
     logger.info(f"Jump node '{node.node_name}' listening on port {args.port}")
     logger.info(f"Node ID: {node.discovery.node_id}")
     if args.token:
@@ -298,8 +304,9 @@ def main():
     parser.add_argument("--port", type=int, default=47701,
                         help="Listen/connect port (default: 47701)",
                         metavar="PORT")
-    parser.add_argument("--token", type=str, default=None,
-                        help="Authentication token for secure jumps")
+    parser.add_argument("--token", type=str, default=_config.auth_token,
+                        help="Authentication token for secure jumps "
+                             "(default: MATRIX_AUTH_TOKEN)")
     parser.add_argument("--name", type=str, default=None,
                         help="Node name (default: hostname)")
 

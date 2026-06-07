@@ -429,5 +429,76 @@ class TestHandshake(unittest.TestCase):
             s2.close()
 
 
+class TestAuthTokenConfidentiality(unittest.TestCase):
+    """The auth token must never travel on the wire in cleartext."""
+
+    def test_token_absent_from_handshake_frames(self):
+        s1, s2 = socket.socketpair()
+        s1.settimeout(5)
+        s2.settimeout(5)
+
+        token = "super-secret-token-value"
+        result = {}
+
+        def server_side():
+            try:
+                result["conn"] = server_handshake(
+                    s2, auth_validator=lambda t: t == token
+                )
+            except Exception as e:  # noqa: BLE001
+                result["error"] = e
+
+        # Record every byte the client transmits.
+        sent_chunks = []
+
+        class RecordingBackend(DirectTCPBackend):
+            def send_bytes(self, data: bytes) -> None:
+                sent_chunks.append(bytes(data))
+                super().send_bytes(data)
+
+        t = threading.Thread(target=server_side)
+        t.start()
+        try:
+            conn = client_handshake(RecordingBackend(s1), "client", auth_token=token)
+            t.join(timeout=5)
+            self.assertIn("conn", result, f"Server error: {result.get('error')}")
+
+            wire = b"".join(sent_chunks)
+            self.assertNotIn(token.encode(), wire,
+                             "Auth token leaked into handshake bytes")
+            # The encrypted AUTH exchange still authenticated successfully.
+            conn.send(MsgType.SESSION_DATA, b"hi")
+            self.assertEqual(result["conn"].recv()[1], b"hi")
+            conn.close()
+            result["conn"].close()
+        finally:
+            s1.close()
+            s2.close()
+
+
+class TestListenerBindHardening(unittest.TestCase):
+    """An unauthenticated listener must not bind a public interface."""
+
+    def test_public_bind_without_auth_refused(self):
+        listener = JumpListener(host="0.0.0.0", port=0)
+        with self.assertRaises(PermissionError):
+            listener.start()
+
+    def test_public_bind_with_auth_allowed(self):
+        listener = JumpListener(host="0.0.0.0", port=0,
+                                auth_validator=lambda t: True)
+        try:
+            listener.start()  # Must not raise.
+        finally:
+            listener.stop()
+
+    def test_loopback_bind_without_auth_allowed(self):
+        listener = JumpListener(host="127.0.0.1", port=0)
+        try:
+            listener.start()  # Local-only is fine without auth.
+        finally:
+            listener.stop()
+
+
 if __name__ == "__main__":
     unittest.main()
