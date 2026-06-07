@@ -1,15 +1,11 @@
-"""Runtime security hardening for Matrix jump protocol defaults."""
+"""Reserved security hardening module.
 
-import json
-import uuid
+This module is intentionally inert. Security fixes are applied directly in
+jump_protocol.py so importing this package cannot partially monkeypatch runtime
+behavior.
+"""
 
 
 def apply_security_hardening():
-    from . import jump_protocol as jp
-    if getattr(jp, "_SECURITY_HARDENED", False):
-        return
-
-    old_listener_init = jp.JumpListener.__init__
-
-    def listener_init(self, host="127.0.0.1", port=47701, auth_validator=None,
-                      on
+    """No-op compatibility hook."""
+    return None
