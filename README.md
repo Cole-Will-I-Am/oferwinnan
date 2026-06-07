@@ -184,7 +184,7 @@ Safety constraints: action budget (default 5), dead-man's switch timeout, AST qu
 
 ## Security
 
-- **Forward secrecy**: Signal-spec symmetric ratchet (KDF_CK) with per-message AES-256-GCM keys
+- **Forward secrecy**: Signal-spec symmetric ratchet (KDF_CK) with per-message AES-256-GCM keys — no symmetric fallback (fails closed), deterministic counter nonces from the single-use message index
 - **Key exchange**: X25519 ECDH with HKDF-SHA256 derivation
 - **Mutual authentication**: Ed25519 node identities signed into the handshake transcript (SIGMA-style) defeat active MITM on the key exchange; SSH-style peer pinning (TOFU or strict allowlist) via a trust store. See [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
 - **Authentication**: encrypted post-handshake `AUTH`/`AUTH_OK` exchange — the token is never sent in cleartext (including on 0-RTT resume); RBAC with constant-time token comparison

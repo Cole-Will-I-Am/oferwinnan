@@ -46,7 +46,7 @@ Trust boundaries:
 | **Spoofing** | MITM substitutes keys on unauthenticated DH | Ed25519 identity signature over the handshake transcript (both ephemerals + version + suite); peer pinning (TOFU / allowlist) | **Implemented** (`identity.py`, `*_handshake`) |
 | **Tampering** | Modify ciphertext in flight | AES-256-GCM AEAD per message; framing length checks | Implemented |
 | **Repudiation** | Deny actions | Director audit log; RBAC | Partial |
-| **Information disclosure** | Eavesdrop; cleartext token | Ratcheted AES-256-GCM; token only sent inside encrypted channel; initiator identity sent encrypted (SIGMA-I) | Implemented |
+| **Information disclosure** | Eavesdrop; cleartext token | Ratcheted AES-256-GCM only (no fallback), deterministic counter nonces; token only sent inside encrypted channel; initiator identity sent encrypted (SIGMA-I) | Implemented |
 | **DoS** | Connection/resource exhaustion | Listener connection semaphore; payload caps; auth timeout | Partial |
 | **Elevation of privilege** | Unauthorized jump | RBAC + token + (optional) required peer identity | Implemented |
 | **Downgrade** | Force weaker suite/version | Suite + version bound into the signed transcript | Implemented |
@@ -85,8 +85,12 @@ These are deliberately tracked, not yet closed:
 
 1. **No post-quantum protection.** Move to hybrid X25519 + ML-KEM-1024 and
    ML-DSA identities (CNSA 2.0). *Harvest-now-decrypt-later applies today.*
-2. **Fernet fallback.** `SessionKeys` retains an AES-128 Fernet path; remove it
-   so the suite is AES-256 only with no downgrade.
+   The HKDF root currently uses SHA-256; move to SHA-384 alongside the PQC pass
+   for full CNSA parity.
+2. ~~**Fernet fallback.**~~ *Resolved:* the AES-128 Fernet path is removed.
+   Encryption is ratcheted AES-256-GCM only and fails closed; nonces are derived
+   deterministically from the single-use message index (no random-nonce
+   collision risk, no nonce on the wire).
 3. **Key custody in interpreter memory.** Python cannot guarantee zeroization.
    Back identity (and ideally session) keys with TPM/HSM/KMS/enclave.
 4. **Server-side client pinning keyed by client-claimed `node_id`.** Use

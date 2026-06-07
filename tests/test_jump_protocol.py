@@ -17,6 +17,7 @@ from matrix.jump_protocol import (
     SessionKeys, SessionKeyCache,
     JumpConnection, JumpListener,
     client_handshake, server_handshake,
+    _nonce_from_index, _RATCHET_INDEX_SIZE, _GCM_TAG_SIZE,
 )
 
 
@@ -427,6 +428,54 @@ class TestHandshake(unittest.TestCase):
         finally:
             s1.close()
             s2.close()
+
+
+class TestSessionCryptoHardening(unittest.TestCase):
+    """Fernet removed, counter-based nonces, fail-closed encryption."""
+
+    def _pair(self):
+        priv_a, pub_a = generate_keypair()
+        priv_b, pub_b = generate_keypair()
+        a = derive_session_keys(priv_a, pub_b, is_initiator=True)
+        b = derive_session_keys(priv_b, pub_a, is_initiator=False)
+        return a, b
+
+    def test_no_fernet_attribute(self):
+        a, _ = self._pair()
+        self.assertFalse(hasattr(a, "fernet"))
+
+    def test_fail_closed_without_ratchet(self):
+        keys = SessionKeys(shared_key=b"\x00" * 32, peer_public=b"\x00" * 32,
+                           ratchet=None)
+        with self.assertRaises(ProtocolError):
+            keys.encrypt(b"data")
+        with self.assertRaises(ProtocolError):
+            keys.decrypt(b"\x00" * 32)
+
+    def test_nonce_is_deterministic_counter(self):
+        self.assertEqual(_nonce_from_index(0), b"\x00" * 12)
+        self.assertEqual(len(_nonce_from_index(1)), 12)
+        self.assertTrue(_nonce_from_index(1).endswith(b"\x01"))
+        self.assertNotEqual(_nonce_from_index(1), _nonce_from_index(2))
+
+    def test_wire_format_has_no_nonce(self):
+        a, b = self._pair()
+        # Empty plaintext -> 4-byte index + 16-byte GCM tag only (no nonce).
+        ct = a.encrypt(b"")
+        self.assertEqual(len(ct), _RATCHET_INDEX_SIZE + _GCM_TAG_SIZE)
+        # Index prefix increments per message and round-trips in order.
+        self.assertEqual(ct[:_RATCHET_INDEX_SIZE], b"\x00\x00\x00\x00")
+        ct1 = a.encrypt(b"hello")
+        self.assertEqual(ct1[:_RATCHET_INDEX_SIZE], b"\x00\x00\x00\x01")
+        self.assertEqual(b.decrypt(ct), b"")
+        self.assertEqual(b.decrypt(ct1), b"hello")
+
+    def test_tamper_is_rejected(self):
+        a, b = self._pair()
+        ct = bytearray(a.encrypt(b"secret"))
+        ct[-1] ^= 0x01  # flip a tag bit
+        with self.assertRaises(ProtocolError):
+            b.decrypt(bytes(ct))
 
 
 class TestAuthTokenConfidentiality(unittest.TestCase):

@@ -1,9 +1,9 @@
 """
 Jump Protocol — Secure connection and data transfer for cross-device jumping.
 
-Handles connections with TLS-like key exchange (using Fernet symmetric
-encryption), chunked data transfer, and protocol framing so that session
-state can be moved reliably between devices.
+Handles connections with a TLS-like X25519 key exchange, ratcheted
+AES-256-GCM message encryption, chunked data transfer, and protocol framing
+so that session state can be moved reliably between devices.
 
 Transport-agnostic: any backend implementing the TransportBackend protocol
 (TCP, WebSocket, QUIC, relay chain, etc.) can carry Jump frames.
@@ -12,7 +12,6 @@ Transport-agnostic: any backend implementing the TransportBackend protocol
 import hashlib
 import hmac
 import json
-import os
 import socket
 import struct
 import threading
@@ -24,7 +23,6 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Callable, Dict, Optional, Protocol, runtime_checkable
 
-from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives.asymmetric import x25519
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -296,51 +294,57 @@ class ProtocolError(Exception):
 
 # Ratchet message header: 4-byte big-endian message index prepended to ciphertext
 _RATCHET_INDEX_SIZE = 4
+_GCM_TAG_SIZE = 16
+
+
+def _nonce_from_index(idx: int) -> bytes:
+    """Deterministic 96-bit AES-GCM nonce from the per-message ratchet index.
+
+    Every ratchet message key is single-use, so a counter-derived nonce
+    guarantees a unique (key, nonce) pair with zero birthday-bound collision
+    risk — strictly safer than a random nonce and removing it from the wire
+    eliminates a malleable, attacker-visible field.
+    """
+    return idx.to_bytes(12, "big")
 
 
 @dataclass
 class SessionKeys:
     shared_key: bytes       # raw 32-byte shared secret
-    fernet: Fernet          # Fernet instance (fallback / legacy)
     peer_public: bytes      # peer's X25519 public key bytes
+    ratchet: RatchetPair    # per-message forward secrecy (mandatory)
     connection_id: str = ""  # unique ID for session resumption
-    ratchet: Optional[RatchetPair] = None  # per-message forward secrecy
 
     def encrypt(self, data: bytes) -> bytes:
-        """Encrypt data. Uses ratcheted AES-256-GCM if available, else Fernet."""
+        """Encrypt with ratcheted AES-256-GCM. Fails closed (no fallback)."""
         if self.ratchet is None:
-            return self.fernet.encrypt(data)
-
+            raise ProtocolError("SessionKeys has no ratchet; refusing to encrypt")
         key, idx = self.ratchet.next_send_key()
         if idx > 0xFFFFFFFF:
             raise ProtocolError("Ratchet message index overflow")
-        nonce = os.urandom(12)
-        aesgcm = AESGCM(key)
-        ciphertext = aesgcm.encrypt(nonce, data, None)
-        # Wire format: [4-byte index][12-byte nonce][ciphertext+tag]
-        return struct.pack("!I", idx) + nonce + ciphertext
+        nonce = _nonce_from_index(idx)
+        ciphertext = AESGCM(key).encrypt(nonce, data, None)
+        # Wire format: [4-byte index][ciphertext+tag]; nonce derived from index.
+        return struct.pack("!I", idx) + ciphertext
 
     def decrypt(self, token: bytes) -> bytes:
-        """Decrypt data. Uses ratcheted AES-256-GCM if available, else Fernet."""
+        """Decrypt ratcheted AES-256-GCM. Fails closed (no fallback)."""
         if self.ratchet is None:
-            return self.fernet.decrypt(token)
-
-        if len(token) < _RATCHET_INDEX_SIZE + 12:
+            raise ProtocolError("SessionKeys has no ratchet; refusing to decrypt")
+        if len(token) < _RATCHET_INDEX_SIZE + _GCM_TAG_SIZE:
             raise ProtocolError("Ratcheted ciphertext too short")
 
         idx = struct.unpack("!I", token[:_RATCHET_INDEX_SIZE])[0]
-        nonce = token[_RATCHET_INDEX_SIZE:_RATCHET_INDEX_SIZE + 12]
-        ciphertext = token[_RATCHET_INDEX_SIZE + 12:]
+        ciphertext = token[_RATCHET_INDEX_SIZE:]
+        nonce = _nonce_from_index(idx)
 
-        key = b""
         try:
             key = self.ratchet.next_recv_key(idx)
         except RatchetError as e:
             raise ProtocolError(f"Ratchet key derivation failed: {e}") from e
 
-        aesgcm = AESGCM(key)
         try:
-            return aesgcm.decrypt(nonce, ciphertext, None)
+            return AESGCM(key).decrypt(nonce, ciphertext, None)
         except Exception as e:
             # Preserve recoverability for the same message index after a failed
             # authentication attempt (e.g., corruption/tampering in transit).
@@ -351,10 +355,9 @@ class SessionKeys:
         """Create an independent copy suitable for resumption handoff."""
         return SessionKeys(
             shared_key=self.shared_key,
-            fernet=self.fernet,
             peer_public=self.peer_public,
-            connection_id=self.connection_id,
             ratchet=self.ratchet.clone() if self.ratchet else None,
+            connection_id=self.connection_id,
         )
 
 
@@ -373,13 +376,12 @@ def derive_session_keys(private_key: x25519.X25519PrivateKey,
                         is_initiator: bool = True) -> SessionKeys:
     """Perform X25519 key agreement and derive ratcheted session keys.
 
-    The shared secret feeds both a Fernet key (for legacy/resumption fallback)
-    and a RatchetPair that provides per-message forward secrecy via
-    AES-256-GCM with Signal-spec KDF_CK chain ratcheting.
+    The shared secret seeds a RatchetPair that provides per-message forward
+    secrecy via AES-256-GCM with Signal-spec KDF_CK chain ratcheting. There is
+    no symmetric fallback: encryption fails closed if the ratchet is absent.
     """
     from cryptography.hazmat.primitives.kdf.hkdf import HKDF
     from cryptography.hazmat.primitives import hashes
-    import base64
 
     peer_public = x25519.X25519PublicKey.from_public_bytes(peer_public_bytes)
     shared = private_key.exchange(peer_public)
@@ -389,14 +391,12 @@ def derive_session_keys(private_key: x25519.X25519PrivateKey,
         salt=None,
         info=b"matrix-jump-v2",
     ).derive(shared)
-    fernet_key = base64.urlsafe_b64encode(derived)
     ratchet = RatchetPair(derived, is_initiator=is_initiator)
     return SessionKeys(
         shared_key=shared,
-        fernet=Fernet(fernet_key),
         peer_public=peer_public_bytes,
-        connection_id=connection_id or uuid.uuid4().hex[:16],
         ratchet=ratchet,
+        connection_id=connection_id or uuid.uuid4().hex[:16],
     )
 
 
