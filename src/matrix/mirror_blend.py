@@ -143,7 +143,7 @@ class MirrorRegistry:
             An instrumented mirror that is call-compatible with `obj`.
         """
         with self._lock:
-            key = self._make_key(obj, name)
+            key = self._make_key(obj, name, pre, post)
 
             cached = self._mirrors.get(key)
             if cached is not None:
@@ -193,27 +193,43 @@ class MirrorRegistry:
 
     # ── Cache Key Construction ────────────────────────────────────────────
 
-    def _make_key(self, obj: Any, name: Optional[str]) -> tuple:
+    def _make_key(
+        self, obj: Any, name: Optional[str], pre: HookFn, post: HookFn
+    ) -> tuple:
         obj_id = id(obj)
         qualname = name or getattr(obj, "__qualname__", None) or repr(obj)
 
-        # Install a weak-ref finalizer to bump generation on GC
+        # Install a weak-ref finalizer that evicts this object's entries when
+        # it is collected, so a reused id can't return a stale mirror.
         if obj_id not in self._weak_refs:
             try:
-                ref = weakref.ref(obj, self._on_gc)
+                ref = weakref.ref(obj, self._gc_callback(obj_id))
                 self._weak_refs[obj_id] = ref
             except TypeError:
                 pass  # Not weak-referenceable (e.g. built-in)
 
-        return _make_cache_key(obj_id, qualname, self._generation)
+        # Hook identities are part of the key: mirroring the same object with
+        # different hooks must yield a distinct mirror, not the cached one.
+        return _make_cache_key(obj_id, qualname, self._generation) + (
+            id(pre), id(post),
+        )
 
-    def _on_gc(self, ref: weakref.ref) -> None:
-        """Weak-ref callback: bump generation so stale ids aren't reused."""
+    def _gc_callback(self, obj_id: int) -> Callable[[Any], None]:
+        """Build a weak-ref callback bound to a specific object id."""
+        def _evict(_ref: Any) -> None:
+            self._on_gc(obj_id)
+        return _evict
+
+    def _on_gc(self, obj_id: int) -> None:
+        """Weak-ref callback: evict only the collected object's entries.
+
+        Eviction is precise — dropping one dead object never invalidates the
+        cache for everything else — and the object's weak-ref is released so
+        the bookkeeping dict doesn't grow without bound.
+        """
         with self._lock:
-            self._generation += 1
-            # Evict dead entries — they'll never match again anyway
-            gen = self._generation
-            dead = [k for k in self._mirrors if k[2] < gen]
+            self._weak_refs.pop(obj_id, None)
+            dead = [k for k in self._mirrors if k[0] == obj_id]
             for k in dead:
                 mirror = self._mirrors.pop(k, None)
                 if mirror is not None:
@@ -689,6 +705,11 @@ class AdaptiveWrapper:
 
     def __getattr__(self, name: str) -> Any:
         """Proxy attribute access to the wrapped target."""
+        # Guard against unbounded recursion if _target isn't set yet (e.g.
+        # during copy/pickle reconstruction before __init__ runs): resolving
+        # self._target would otherwise re-enter __getattr__ forever.
+        if name == "_target":
+            raise AttributeError(name)
         return getattr(self._target, name)
 
     def __repr__(self) -> str:

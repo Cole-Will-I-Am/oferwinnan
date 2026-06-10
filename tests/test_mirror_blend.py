@@ -149,6 +149,44 @@ class TestMirrorFunction(unittest.TestCase):
         mirror = self.registry.mirror(sample_add)
         self.assertIs(mirror.__mirror_origin__, sample_add)
 
+    def test_different_hooks_yield_distinct_mirrors(self):
+        """Re-mirroring the same object with different hooks must not return
+        the cached mirror bound to the old hooks."""
+        def pre_a(fn, args, kwargs):
+            return (args[0] + 1, args[1]), kwargs
+
+        def pre_b(fn, args, kwargs):
+            return (args[0] + 100, args[1]), kwargs
+
+        m_a = self.registry.mirror(sample_add, pre=pre_a)
+        m_b = self.registry.mirror(sample_add, pre=pre_b)
+        self.assertIsNot(m_a, m_b)
+        self.assertEqual(m_a(0, 0), 1)
+        self.assertEqual(m_b(0, 0), 100)
+
+    def test_same_hook_still_cached(self):
+        def pre(fn, args, kwargs):
+            return None
+
+        self.assertIs(
+            self.registry.mirror(sample_add, pre=pre),
+            self.registry.mirror(sample_add, pre=pre),
+        )
+
+    def test_on_gc_evicts_only_target_object(self):
+        """Collecting one mirrored object must not flush the whole cache."""
+        m1 = self.registry.mirror(sample_add, name="a")
+        m2 = self.registry.mirror(sample_greet, name="b")
+        self.assertEqual(self.registry.mirror_count, 2)
+
+        self.registry._on_gc(id(sample_add))
+
+        self.assertEqual(self.registry.mirror_count, 1)
+        self.assertTrue(self.registry.is_mirrored(m2))
+        self.assertFalse(self.registry.is_mirrored(m1))
+        # The dead object's weak-ref bookkeeping is released too.
+        self.assertNotIn(id(sample_add), self.registry._weak_refs)
+
 
 class TestMirrorHooks(unittest.TestCase):
 
@@ -595,6 +633,13 @@ class TestAdaptiveWrapper(unittest.TestCase):
         fn.custom_attr = "forwarded"
         wrapper = AdaptiveWrapper(fn, self.registry)
         self.assertEqual(wrapper.custom_attr, "forwarded")
+
+    def test_getattr_without_target_does_not_recurse(self):
+        """Accessing an attribute before __init__ sets _target must raise
+        AttributeError rather than recursing forever."""
+        bare = AdaptiveWrapper.__new__(AdaptiveWrapper)
+        with self.assertRaises(AttributeError):
+            bare._target  # noqa: B018
 
     def test_mode_full_by_default(self):
         wrapper = AdaptiveWrapper(sample_add, self.registry)
