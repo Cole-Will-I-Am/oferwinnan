@@ -13,6 +13,7 @@ Layer 4: AutonomousLoop     — The feedback loop that ties it all together
 from __future__ import annotations
 
 import ast
+import base64
 import importlib
 import importlib.util
 import logging
@@ -37,6 +38,7 @@ class _FallbackSlot:
     namespace: Any              # module or globals dict
     namespace_kind: str         # "module" or "globals"
     fallbacks: list             # ordered list of fallback callables
+    key: str = ""               # protection key (stable across re-installs)
     attempt: int = 0            # index into fallbacks currently active
     blend_key: str = ""         # current blend key (for revert)
     failure_count: int = 0      # total failures observed
@@ -102,6 +104,7 @@ class ResilienceManager:
                 namespace=namespace,
                 namespace_kind="module" if isinstance(namespace, types.ModuleType) else "globals",
                 fallbacks=list(fallbacks),
+                key=pkey,
                 attempt=0,
             )
             self._slots[pkey] = slot
@@ -132,10 +135,6 @@ class ResilienceManager:
         fn = slot.fallbacks[index]
         slot.attempt = index
 
-        def post_hook(original, result):
-            if isinstance(result, BaseException):
-                self._on_failure(slot, result)
-
         def safe_wrapper(*args, **kwargs):
             try:
                 return fn(*args, **kwargs)
@@ -154,13 +153,11 @@ class ResilienceManager:
 
         if slot.namespace_kind == "module":
             slot.blend_key = self._blender.blend_into_module(
-                slot.namespace, slot.name, mirror,
-                key=f"resilient:{_ns_label(slot.namespace)}.{slot.name}",
+                slot.namespace, slot.name, mirror, key=slot.key,
             )
         else:
             slot.blend_key = self._blender.blend_into_globals(
-                slot.namespace, slot.name, mirror,
-                key=f"resilient:globals.{slot.name}",
+                slot.namespace, slot.name, mirror, key=slot.key,
             )
 
     def _on_failure(self, slot: _FallbackSlot, exc: BaseException) -> None:
@@ -269,7 +266,7 @@ class EnvironmentAdapter:
         )
         with self._lock:
             self._swap_registry[key] = slot
-        self._apply_mode_to_slot(slot, self._mode)
+            self._apply_mode_to_slot(slot, self._mode)
         return key
 
     def update_metrics(self, **kwargs: float) -> None:
@@ -284,12 +281,12 @@ class EnvironmentAdapter:
 
         Returns the newly selected mode.
         """
-        mode = self._evaluate()
-        if mode != self._mode:
-            old = self._mode
-            self._mode = mode
-            logger.info("EnvironmentAdapter: mode %s → %s", old, mode)
-            with self._lock:
+        with self._lock:
+            mode = self._evaluate()
+            if mode != self._mode:
+                old = self._mode
+                self._mode = mode
+                logger.info("EnvironmentAdapter: mode %s → %s", old, mode)
                 for slot in self._swap_registry.values():
                     self._apply_mode_to_slot(slot, mode)
         return mode
@@ -531,8 +528,6 @@ class HotUpgrader:
         Returns:
             List of version indices for each applied upgrade.
         """
-        import base64
-
         versions = []
         for rel_path, b64data in session.files.items():
             if not rel_path.endswith(".py"):
@@ -663,6 +658,7 @@ class AutonomousLoop:
         self.target_module = target_module
         self._tick_interval = tick_interval
         self._running = False
+        self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._tick_count = 0
         self._lock = threading.Lock()
@@ -682,6 +678,7 @@ class AutonomousLoop:
         if self._running:
             return
         self._running = True
+        self._stop_event.clear()
         self._thread = threading.Thread(target=self._loop, daemon=True, name="autonomous")
         self._thread.start()
         logger.info("AutonomousLoop: started (interval=%.1fs)", self._tick_interval)
@@ -689,6 +686,7 @@ class AutonomousLoop:
     def stop(self) -> None:
         """Stop the loop and clean up."""
         self._running = False
+        self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=self._tick_interval * 3)
         logger.info("AutonomousLoop: stopped after %d ticks", self._tick_count)
@@ -718,7 +716,7 @@ class AutonomousLoop:
         }
 
     def _loop(self) -> None:
-        while self._running:
+        while not self._stop_event.is_set():
             t0 = time.monotonic()
             try:
                 self._tick()
@@ -727,7 +725,8 @@ class AutonomousLoop:
             elapsed = time.monotonic() - t0
             sleep_time = self._tick_interval - elapsed
             if sleep_time > 0:
-                time.sleep(sleep_time)
+                # Interruptible wait — stop() wakes us immediately.
+                self._stop_event.wait(sleep_time)
 
     def _tick(self) -> None:
         self._tick_count += 1

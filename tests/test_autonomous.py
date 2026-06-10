@@ -90,6 +90,21 @@ class TestResilienceManager(unittest.TestCase):
         self.rm.protect(mod, "b", [lambda: 20])
         self.assertEqual(self.rm.protection_count, 2)
 
+    def test_custom_keys_do_not_collide_on_same_name(self):
+        """Two protections on the same name with distinct keys must each be
+        revertible without clobbering one another's blend state."""
+        mod = _make_module(fn=lambda: "original")
+        k1 = self.rm.protect(mod, "fn", [lambda: "first"], key="custom:1")
+        # Re-protect the same attribute under a different key.
+        k2 = self.rm.protect(mod, "fn", [lambda: "second"], key="custom:2")
+        self.assertEqual(mod.fn(), "second")
+
+        # Reverting the latest restores the prior blend, not a lost original.
+        self.rm.unprotect(k2)
+        self.assertEqual(mod.fn(), "first")
+        self.rm.unprotect(k1)
+        self.assertEqual(mod.fn(), "original")
+
 
 # ── Layer 2: EnvironmentAdapter ──────────────────────────────────────────────
 
@@ -268,6 +283,17 @@ class TestAutonomousLoop(unittest.TestCase):
         time.sleep(0.2)
         self.assertGreater(loop.tick_count, 0)
         loop.stop()
+        self.assertFalse(loop.is_running)
+
+    def test_stop_is_prompt_with_long_interval(self):
+        """stop() should interrupt a sleeping tick rather than block a full
+        interval."""
+        loop = AutonomousLoop(self.registry, self.blender, tick_interval=10.0)
+        loop.start()
+        time.sleep(0.05)  # let it enter the interruptible wait
+        t0 = time.monotonic()
+        loop.stop()
+        self.assertLess(time.monotonic() - t0, 2.0)
         self.assertFalse(loop.is_running)
 
     def test_metrics_collector_integration(self):
