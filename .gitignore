@@ -7,3 +7,7 @@ build/
 *.egg
 .env
 .venv/
+.env.bak
+identity.key
+known_peers.json
+*.key
