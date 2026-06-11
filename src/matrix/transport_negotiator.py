@@ -387,10 +387,14 @@ class CoverTrafficGenerator:
 
     def __init__(self, connection: JumpConnection,
                  min_interval: float = 1.0,
-                 max_interval: float = 5.0):
+                 max_interval: float = 5.0,
+                 send_lock: Optional[threading.Lock] = None):
         self._conn = connection
         self._min = min_interval
         self._max = max_interval
+        # Shared with the owning NormalizedConnection so a chaff PING can never
+        # interleave with a real send and corrupt the ratchet / frame ordering.
+        self._send_lock = send_lock or threading.Lock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._paused = threading.Event()
@@ -440,14 +444,17 @@ class CoverTrafficGenerator:
                 continue
 
             try:
-                # Send chaff ping with random payload
+                # Send chaff ping with random payload — hold the shared send
+                # lock so it can't interleave with a real NormalizedConnection
+                # send (which mutates the symmetric ratchet).
                 chaff = os.urandom(random.randint(16, 128))
-                self._conn.send(MsgType.PING, chaff)
-                # Read pong (or discard)
-                try:
-                    self._conn.recv(timeout=1.0)
-                except (ConnectionError, ProtocolError, TimeoutError):
-                    pass
+                with self._send_lock:
+                    self._conn.send(MsgType.PING, chaff)
+                    # Read pong (or discard)
+                    try:
+                        self._conn.recv(timeout=1.0)
+                    except (ConnectionError, ProtocolError, TimeoutError):
+                        pass
             except (ConnectionError, OSError):
                 self._running = False
                 break
@@ -603,9 +610,10 @@ class NormalizedConnection:
         self._profile = profile or PlainProfile()
         self._padding = enable_padding
         self._cover: Optional[CoverTrafficGenerator] = None
+        self._send_lock = threading.Lock()
 
         if enable_cover_traffic:
-            self._cover = CoverTrafficGenerator(connection)
+            self._cover = CoverTrafficGenerator(connection, send_lock=self._send_lock)
             self._cover.start()
 
     _PAD_MAGIC = b"NPAD"
@@ -625,8 +633,10 @@ class NormalizedConnection:
                 wrapped = self._PAD_MAGIC + struct.pack("!I", len(wrapped)) + wrapped
                 wrapped = pad_frame(wrapped)
 
-            # Encrypt and send via the underlying connection
-            self._conn.send(msg_type, wrapped)
+            # Encrypt and send under the shared lock so an in-flight chaff PING
+            # can't interleave and corrupt the ratchet.
+            with self._send_lock:
+                self._conn.send(msg_type, wrapped)
 
             # Apply timing jitter
             self._jitter.delay()

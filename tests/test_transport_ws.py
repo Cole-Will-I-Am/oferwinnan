@@ -84,7 +84,7 @@ class TestWsFraming(unittest.TestCase):
         sock = MagicMock()
         sock.recv.side_effect = [raw]
         buf = bytearray(raw)
-        opcode, data = _ws_read_frame(sock, buf)
+        _, opcode, data = _ws_read_frame(sock, buf)
         self.assertEqual(opcode, WS_BINARY)
         self.assertEqual(data, payload)
 
@@ -93,7 +93,7 @@ class TestWsFraming(unittest.TestCase):
         raw = self._make_frame(WS_BINARY, payload, mask=True)
         buf = bytearray(raw)
         sock = MagicMock()
-        opcode, data = _ws_read_frame(sock, buf)
+        _, opcode, data = _ws_read_frame(sock, buf)
         self.assertEqual(opcode, WS_BINARY)
         self.assertEqual(data, payload)
 
@@ -120,7 +120,7 @@ class TestWsFraming(unittest.TestCase):
         raw = self._make_frame(WS_BINARY, payload)
         buf = bytearray(raw)
         sock = MagicMock()
-        opcode, data = _ws_read_frame(sock, buf)
+        _, opcode, data = _ws_read_frame(sock, buf)
         self.assertEqual(len(data), 200)
         self.assertEqual(data, payload)
 

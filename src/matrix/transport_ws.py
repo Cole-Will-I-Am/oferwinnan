@@ -41,6 +41,13 @@ WS_CLOSE = 0x8
 WS_PING = 0x9
 WS_PONG = 0xA
 
+# Hard caps to prevent a malicious/buggy peer from exhausting memory: a single
+# WebSocket frame and a reassembled message are both bounded. Control frames
+# (ping/pong/close) are tiny by spec.
+WS_MAX_FRAME = 64 * 1024 * 1024       # 64 MiB per frame
+WS_MAX_MESSAGE = 256 * 1024 * 1024    # 256 MiB per reassembled message
+WS_MAX_CONTROL = 125                  # RFC 6455: control payloads <= 125 bytes
+
 
 def _ws_recv_exact(sock, n: int, buf: bytearray = None) -> bytes:
     """Read exactly n bytes, consuming from buf first, then from socket."""
@@ -62,12 +69,15 @@ def _ws_recv_exact(sock, n: int, buf: bytearray = None) -> bytes:
     return bytes(result)
 
 
-def _ws_read_frame(sock, buf: bytearray = None) -> tuple[int, bytes]:
-    """Read a single WebSocket frame, return (opcode, payload).
+def _ws_read_frame(sock, buf: bytearray = None) -> tuple[bool, int, bytes]:
+    """Read a single WebSocket frame, return (fin, opcode, payload).
 
     If buf is provided, consumes buffered data before reading from socket.
+    Enforces RFC 6455 length caps: rejects oversized frames (DoS guard) and
+    control frames that exceed 125 bytes or claim to be fragmented.
     """
     header = _ws_recv_exact(sock, 2, buf)
+    fin = (header[0] & 0x80) != 0
     opcode = header[0] & 0x0F
     masked = (header[1] & 0x80) != 0
     length = header[1] & 0x7F
@@ -77,6 +87,12 @@ def _ws_read_frame(sock, buf: bytearray = None) -> tuple[int, bytes]:
     elif length == 127:
         length = struct.unpack("!Q", _ws_recv_exact(sock, 8, buf))[0]
 
+    is_control = opcode in (WS_CLOSE, WS_PING, WS_PONG)
+    if is_control and (length > WS_MAX_CONTROL or not fin):
+        raise ConnectionError(f"invalid control frame (len={length}, fin={fin})")
+    if length > WS_MAX_FRAME:
+        raise ConnectionError(f"WebSocket frame too large: {length} bytes")
+
     mask_key = _ws_recv_exact(sock, 4, buf) if masked else None
 
     payload = _ws_recv_exact(sock, length, buf) if length > 0 else b""
@@ -84,7 +100,7 @@ def _ws_read_frame(sock, buf: bytearray = None) -> tuple[int, bytes]:
     if mask_key:
         payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
 
-    return opcode, payload
+    return fin, opcode, payload
 
 
 def _ws_write_frame(sock, opcode: int, payload: bytes, mask: bool = False):
@@ -248,14 +264,21 @@ class WebSocketBackend:
     """
 
     def __init__(self, sock: socket.socket, is_client: bool = True,
-                 initial_buf: bytearray = None):
+                 initial_buf: bytearray = None,
+                 on_close: Optional[Callable[[], None]] = None):
         self._sock = sock
         self._is_client = is_client  # clients must mask frames per RFC 6455
         self._connected = True
-        self._recv_buf = bytearray(initial_buf) if initial_buf else bytearray()
+        # initial_buf is RAW post-handshake bytes — it belongs only in the
+        # frame parser buffer (_ws_buf), never in the decoded app stream
+        # (_recv_buf), or piggybacked frame bytes get delivered as garbage.
+        self._recv_buf = bytearray()
         self._ws_buf = bytearray(initial_buf) if initial_buf else bytearray()
+        self._frag = bytearray()      # in-progress fragmented message
         self._lock = threading.Lock()
         self._recv_lock = threading.Lock()
+        self._on_close = on_close
+        self._close_fired = False
         try:
             peer = sock.getpeername()
             if isinstance(peer, tuple) and len(peer) >= 2:
@@ -348,15 +371,25 @@ class WebSocketBackend:
                 if not self._connected:
                     raise ConnectionError("WebSocket is closed")
                 try:
-                    opcode, payload = _ws_read_frame(self._sock, self._ws_buf)
+                    fin, opcode, payload = _ws_read_frame(self._sock, self._ws_buf)
                 except (ConnectionError, OSError) as e:
                     self._connected = False
                     raise ConnectionError(f"WebSocket recv failed: {e}") from e
 
-                if opcode == WS_BINARY or opcode == WS_TEXT:
-                    self._recv_buf.extend(payload)
+                if opcode in (WS_BINARY, WS_TEXT, WS_CONTINUATION):
+                    # Reassemble fragmented messages: data frames may arrive as
+                    # an initial BINARY/TEXT (fin may be 0) followed by
+                    # CONTINUATION frames until fin=1.
+                    self._frag.extend(payload)
+                    if len(self._frag) > WS_MAX_MESSAGE:
+                        self._connected = False
+                        raise ConnectionError("WebSocket message exceeds size cap")
+                    if fin:
+                        self._recv_buf.extend(self._frag)
+                        self._frag = bytearray()
                 elif opcode == WS_PING:
-                    # Reply with pong (auto-handle)
+                    # Reply with pong (auto-handle); control frames may interleave
+                    # with data fragments, so handle them inline.
                     try:
                         _ws_write_frame(self._sock, WS_PONG, payload,
                                         mask=self._is_client)
@@ -379,21 +412,28 @@ class WebSocketBackend:
             return result
 
     def close(self) -> None:
-        if not self._connected:
-            return
-        self._connected = False
-        try:
-            _ws_write_frame(self._sock, WS_CLOSE, b"", mask=self._is_client)
-        except OSError:
-            pass
-        try:
-            self._sock.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
-        try:
-            self._sock.close()
-        except OSError:
-            pass
+        if self._connected:
+            self._connected = False
+            try:
+                _ws_write_frame(self._sock, WS_CLOSE, b"", mask=self._is_client)
+            except OSError:
+                pass
+            try:
+                self._sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+        # Free the listener's connection slot exactly once, on real close.
+        if not self._close_fired:
+            self._close_fired = True
+            if self._on_close is not None:
+                try:
+                    self._on_close()
+                except Exception:
+                    pass
 
     @property
     def peer_address(self) -> str:
@@ -509,10 +549,14 @@ class WebSocketListener:
                 self._conn_semaphore.release()
                 return
 
-            backend = WebSocketBackend(sock, is_client=False, initial_buf=excess)
+            # The slot is freed when the backend closes (not when on_backend
+            # returns) so max_connections actually bounds LIVE connections.
+            backend = WebSocketBackend(sock, is_client=False, initial_buf=excess,
+                                       on_close=self._conn_semaphore.release)
             if self._on_backend:
                 self._on_backend(backend)
-            self._conn_semaphore.release()
+            else:
+                backend.close()
 
         except (ConnectionError, OSError) as e:
             logger.debug("WebSocket upgrade failed from %s: %s", addr, e)

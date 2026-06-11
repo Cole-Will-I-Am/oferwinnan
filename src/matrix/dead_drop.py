@@ -107,9 +107,13 @@ class FileSystemDeadDrop(CloudStorageAdapter):
         self._base.mkdir(parents=True, exist_ok=True)
 
     def _safe_resolve(self, path: str) -> Path:
-        """Resolve *path* within base and reject traversal escapes."""
+        """Resolve *path* within base and reject traversal escapes.
+
+        Uses is_relative_to (not a string prefix) so a sibling dir like
+        ``/base-evil`` can't pass a ``/base`` prefix check.
+        """
         full = (self._base / path).resolve()
-        if not str(full).startswith(str(self._base)):
+        if full != self._base and not full.is_relative_to(self._base):
             raise DeadDropError(f"path traversal blocked: {path}")
         return full
 
@@ -165,14 +169,29 @@ class S3DeadDrop(CloudStorageAdapter):
         self._endpoint = endpoint or f"https://{bucket}.s3.{region}.amazonaws.com"
         self._service = "s3"
 
+    @staticmethod
+    def _canonical_query(query: Optional[Dict[str, str]]) -> str:
+        """RFC 3986 canonical querystring (sorted, encoded) for SigV4."""
+        if not query:
+            return ""
+        items = sorted(
+            (urlquote(k, safe=""), urlquote(v, safe="")) for k, v in query.items()
+        )
+        return "&".join(f"{k}={v}" for k, v in items)
+
     def _sign_v4(
         self,
         method: str,
         path: str,
         headers: Dict[str, str],
         payload: bytes = b"",
+        query: Optional[Dict[str, str]] = None,
     ) -> Dict[str, str]:
-        """Generate AWS Signature V4 headers."""
+        """Generate AWS Signature V4 headers.
+
+        The canonical querystring MUST match the request's query params exactly,
+        or AWS rejects the signature (this is why list_objects used to 403).
+        """
         now = datetime.datetime.now(datetime.UTC)
         datestamp = now.strftime("%Y%m%d")
         amz_date = now.strftime("%Y%m%dT%H%M%SZ")
@@ -183,7 +202,7 @@ class S3DeadDrop(CloudStorageAdapter):
 
         # Canonical request
         canonical_uri = urlquote(path, safe="/")
-        canonical_querystring = ""
+        canonical_querystring = self._canonical_query(query)
         signed_header_keys = sorted(headers.keys())
         canonical_headers = "".join(
             f"{k.lower()}:{headers[k].strip()}\n" for k in signed_header_keys
@@ -246,30 +265,43 @@ class S3DeadDrop(CloudStorageAdapter):
         return self._request("GET", path)
 
     def list_objects(self, prefix: str) -> List[str]:
-        # Use list-type=2 API
+        """List keys under *prefix* via ListObjectsV2, following continuation
+        tokens so mailboxes with >1000 messages are fully visible."""
         import xml.etree.ElementTree as ET
-        url = f"{self._endpoint}/?list-type=2&prefix={urlquote(prefix, safe='')}"
-        headers = {"Host": self._endpoint.split("//", 1)[-1].split("/")[0]}
-        headers = self._sign_v4("GET", "/", headers)
-        req = Request(url, headers=headers, method="GET")
-        try:
-            with urlopen(req, timeout=30) as resp:
-                body = resp.read()
-            root = ET.fromstring(body)
-            ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
-            keys = []
-            for content in root.findall(".//s3:Contents/s3:Key", ns):
-                if content.text:
-                    keys.append(content.text)
-            # Fallback: try without namespace
-            if not keys:
-                for content in root.iter():
-                    if content.tag.endswith("Key") and content.text:
+
+        host = self._endpoint.split("//", 1)[-1].split("/")[0]
+        keys: List[str] = []
+        token: Optional[str] = None
+        for _ in range(1000):  # hard bound on pages (safety)
+            query = {"list-type": "2", "prefix": prefix}
+            if token:
+                query["continuation-token"] = token
+            qs = self._canonical_query(query)
+            url = f"{self._endpoint}/?{qs}"
+            headers = self._sign_v4("GET", "/", {"Host": host}, query=query)
+            req = Request(url, headers=headers, method="GET")
+            try:
+                with urlopen(req, timeout=30) as resp:
+                    body = resp.read()
+                root = ET.fromstring(body)
+            except (URLError, ET.ParseError) as exc:
+                raise DeadDropError(f"S3 list failed: {exc}") from exc
+
+            for content in root.iter():
+                if content.tag.endswith("}Key") or content.tag == "Key":
+                    if content.text:
                         keys.append(content.text)
-            keys.sort()
-            return keys
-        except (URLError, ET.ParseError) as exc:
-            raise DeadDropError(f"S3 list failed: {exc}") from exc
+            # Continuation
+            token = None
+            for el in root.iter():
+                if el.tag.endswith("NextContinuationToken") and el.text:
+                    token = el.text
+                    break
+            if not token:
+                break
+
+        keys.sort()
+        return keys
 
     def delete(self, path: str) -> None:
         self._request("DELETE", path)
@@ -321,6 +353,10 @@ class DeadDropBackend:
         self._recv_lock = threading.Lock()
         self._connected = True
 
+        # Keys already consumed (so a failed delete can't re-deliver bytes).
+        self._seen: set = set()
+        self._MAX_SEEN = 10000
+
         # Background poller
         self._poll_thread: Optional[threading.Thread] = None
         self._poll_running = False
@@ -344,8 +380,23 @@ class DeadDropBackend:
                 logger.debug("dead-drop poll error: %s", exc)
             time.sleep(self._config.poll_interval)
 
+    @staticmethod
+    def _msg_timestamp(obj_key: str) -> Optional[float]:
+        """Parse the wall-clock timestamp embedded in a message key."""
+        base = obj_key.rsplit("/", 1)[-1]
+        head = base.split("_", 1)[0]
+        try:
+            return float(head)
+        except ValueError:
+            return None
+
     def _poll_inbox(self) -> None:
-        """Check inbox for new messages and buffer them."""
+        """Check inbox for new messages, expire stale ones, and buffer the rest.
+
+        Read-then-delete is not atomic, so a key is recorded in ``_seen`` the
+        moment its bytes are buffered; if the delete then fails, the next poll
+        re-attempts the delete but never re-delivers the bytes (no duplicates).
+        """
         inbox = self._inbox_path(self._local_id)
         try:
             objects = self._adapter.list_objects(inbox)
@@ -353,14 +404,43 @@ class DeadDropBackend:
             return
 
         now = time.time()
+        ttl = self._config.ttl
         for obj_key in objects:
+            # TTL: drop undelivered blobs older than ttl so mailboxes self-clean.
+            ts = self._msg_timestamp(obj_key)
+            if ttl and ts is not None and now - ts > ttl:
+                try:
+                    self._adapter.delete(obj_key)
+                except DeadDropError:
+                    pass
+                self._seen.discard(obj_key)
+                continue
+
+            if obj_key in self._seen:
+                # Bytes already consumed; just retry the delete idempotently.
+                try:
+                    self._adapter.delete(obj_key)
+                    self._seen.discard(obj_key)
+                except DeadDropError:
+                    pass
+                continue
+
             try:
                 data = self._adapter.read(obj_key)
                 with self._recv_lock:
                     self._recv_buffer.extend(data)
-                self._adapter.delete(obj_key)
+                self._seen.add(obj_key)
+                try:
+                    self._adapter.delete(obj_key)
+                    self._seen.discard(obj_key)
+                except DeadDropError:
+                    pass  # keep in _seen; deletion retried next poll
             except DeadDropError as exc:
                 logger.debug("failed to read dead-drop message: %s", exc)
+
+        # Bound the seen-set so it can't grow without limit.
+        if len(self._seen) > self._MAX_SEEN:
+            self._seen.clear()
 
     # -- TransportBackend Protocol ---------------------------------------------
 
