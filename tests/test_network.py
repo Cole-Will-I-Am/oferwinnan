@@ -391,7 +391,7 @@ class TestWebSocketFraming(unittest.TestCase):
 
         payload = b"hello websocket"
         _ws_write_frame(s1, WS_BINARY, payload, mask=False)
-        opcode, data = _ws_read_frame(s2)
+        _fin, opcode, data = _ws_read_frame(s2)
 
         self.assertEqual(opcode, WS_BINARY)
         self.assertEqual(data, payload)
@@ -404,7 +404,7 @@ class TestWebSocketFraming(unittest.TestCase):
 
         payload = b"masked data"
         _ws_write_frame(s1, WS_BINARY, payload, mask=True)
-        opcode, data = _ws_read_frame(s2)
+        _fin, opcode, data = _ws_read_frame(s2)
 
         self.assertEqual(opcode, WS_BINARY)
         self.assertEqual(data, payload)
@@ -417,7 +417,7 @@ class TestWebSocketFraming(unittest.TestCase):
 
         payload = os.urandom(5000)
         _ws_write_frame(s1, WS_BINARY, payload, mask=False)
-        opcode, data = _ws_read_frame(s2)
+        _fin, opcode, data = _ws_read_frame(s2)
 
         self.assertEqual(data, payload)
         s1.close()
@@ -429,7 +429,7 @@ class TestWebSocketFraming(unittest.TestCase):
 
         payload = os.urandom(70000)
         _ws_write_frame(s1, WS_BINARY, payload, mask=False)
-        opcode, data = _ws_read_frame(s2)
+        _fin, opcode, data = _ws_read_frame(s2)
 
         self.assertEqual(data, payload)
         s1.close()
@@ -439,12 +439,12 @@ class TestWebSocketFraming(unittest.TestCase):
         s1, s2 = socket.socketpair()
 
         _ws_write_frame(s1, WS_PING, b"ping!", mask=False)
-        opcode, data = _ws_read_frame(s2)
+        _fin, opcode, data = _ws_read_frame(s2)
         self.assertEqual(opcode, WS_PING)
         self.assertEqual(data, b"ping!")
 
         _ws_write_frame(s2, WS_PONG, b"ping!", mask=False)
-        opcode, data = _ws_read_frame(s1)
+        _fin, opcode, data = _ws_read_frame(s1)
         self.assertEqual(opcode, WS_PONG)
 
         s1.close()
@@ -491,7 +491,7 @@ class TestWebSocketHandshake(unittest.TestCase):
 
         # Read the server's binary frame (pass excess buffer)
         ws_buf = bytearray(excess)
-        opcode, data = _ws_read_frame(sock, ws_buf)
+        _fin, opcode, data = _ws_read_frame(sock, ws_buf)
         client_read.set()
         self.assertEqual(opcode, WS_BINARY)
         self.assertEqual(data, b"upgraded!")
