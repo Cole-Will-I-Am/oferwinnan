@@ -147,6 +147,85 @@ class TestSemanticDelta(unittest.TestCase):
         delta.loop_status = "not a dict"  # type: ignore
         self.assertFalse(SemanticDelta.validate(delta))
 
+    # ── trigger-aware evidence validation (#2) ──────────────────────────────
+
+    def test_validate_for_trigger_manual_always_ok(self):
+        delta = self._make_delta()  # MANUAL_ESCALATE, no special evidence needed
+        ok, missing = SemanticDelta.validate_for_trigger(delta)
+        self.assertTrue(ok)
+        self.assertEqual(missing, [])
+
+    def test_validate_for_trigger_transport_failure_needs_probe(self):
+        delta = self._make_delta()
+        delta.event = _make_event(EscalationTrigger.TRANSPORT_TOTAL_FAILURE)
+        delta.transport_probe = None
+        ok, missing = SemanticDelta.validate_for_trigger(delta)
+        self.assertFalse(ok)
+        self.assertIn("transport_probe", missing)
+        # ...satisfied once a probe is present
+        delta.transport_probe = {"all_degraded": True}
+        ok, missing = SemanticDelta.validate_for_trigger(delta)
+        self.assertTrue(ok)
+
+    def test_validate_for_trigger_task_failure_needs_failures(self):
+        delta = self._make_delta()
+        delta.event = _make_event(EscalationTrigger.TASK_FAILURE_RATE)
+        delta.recent_task_failures = []
+        ok, missing = SemanticDelta.validate_for_trigger(delta)
+        self.assertFalse(ok)
+        self.assertIn("recent_task_failures", missing)
+
+    def test_validate_for_trigger_all_paths_degraded_needs_path_health(self):
+        delta = self._make_delta()
+        delta.event = _make_event(EscalationTrigger.ALL_PATHS_DEGRADED)
+        delta.path_health = {}
+        ok, missing = SemanticDelta.validate_for_trigger(delta)
+        self.assertFalse(ok)
+        self.assertIn("path_health", missing)
+
+    def test_validate_for_trigger_base_invalid(self):
+        delta = self._make_delta()
+        delta.event = "not an event"  # type: ignore
+        ok, missing = SemanticDelta.validate_for_trigger(delta)
+        self.assertFalse(ok)
+        self.assertEqual(missing, ["base schema invalid"])
+
+
+class TestTransportProbe(unittest.TestCase):
+    """_build_transport_probe summarizes MultiPath health for the LLM."""
+
+    class _FakeMP:
+        all_degraded = False
+
+        def get_health(self):
+            return {
+                "p1": {"transport": "tcp", "state": "healthy"},
+                "p2": {"transport": "websocket", "state": "degraded"},
+            }
+
+    def _probe(self, multipath, event):
+        # Method only touches self._multipath, so a stub self suffices.
+        from matrix.director import TriStateDirector
+        return TriStateDirector._build_transport_probe(
+            types.SimpleNamespace(_multipath=multipath), event)
+
+    def test_summarizes_multipath_health(self):
+        probe = self._probe(self._FakeMP(), _make_event())
+        self.assertEqual(probe["paths_total"], 2)
+        self.assertEqual(probe["paths_healthy"], 1)
+        self.assertFalse(probe["all_degraded"])
+        self.assertEqual(probe["transports"], ["tcp", "websocket"])
+
+    def test_folds_in_transport_failure_details(self):
+        event = _make_event(EscalationTrigger.TRANSPORT_TOTAL_FAILURE,
+                            details={"errors": "all probes failed"})
+        probe = self._probe(self._FakeMP(), event)
+        self.assertEqual(probe["failure"], {"errors": "all probes failed"})
+
+    def test_none_when_no_multipath_and_no_details(self):
+        probe = self._probe(None, _make_event())
+        self.assertIsNone(probe)
+
 
 # ── AuditEntry ───────────────────────────────────────────────────────────────
 

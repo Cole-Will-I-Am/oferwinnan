@@ -142,6 +142,29 @@ class SemanticDelta:
             and isinstance(delta.adapter_metrics, dict)
         )
 
+    @classmethod
+    def validate_for_trigger(cls, delta: SemanticDelta) -> tuple[bool, List[str]]:
+        """Trigger-aware evidence check on top of the base schema validation.
+
+        Returns ``(ok, missing)``. Each trigger needs the evidence the LLM must
+        actually reason over: a transport failure without a ``transport_probe``,
+        or a task-failure escalation with no ``recent_task_failures``, gives the
+        AI tier nothing to act on. Callers should LOG ``missing`` but still
+        proceed — a thin delta during a real incident beats dropping the
+        escalation entirely.
+        """
+        if not cls.validate(delta):
+            return False, ["base schema invalid"]
+        missing: List[str] = []
+        trigger = delta.event.trigger
+        if trigger == EscalationTrigger.TRANSPORT_TOTAL_FAILURE and not delta.transport_probe:
+            missing.append("transport_probe")
+        elif trigger == EscalationTrigger.ALL_PATHS_DEGRADED and not delta.path_health:
+            missing.append("path_health")
+        elif trigger == EscalationTrigger.TASK_FAILURE_RATE and not delta.recent_task_failures:
+            missing.append("recent_task_failures")
+        return (not missing), missing
+
 
 @dataclass(slots=True)
 class ToolResult:
@@ -1174,6 +1197,36 @@ class TriStateDirector:
 
     # ── Semantic Delta Assembly ──────────────────────────────────────────
 
+    def _build_transport_probe(self, event: EscalationEvent) -> Optional[dict]:
+        """Summarize transport health for the LLM.
+
+        Derived from the MultiPath health snapshot rather than a fresh
+        negotiation: a blocking ``TransportNegotiator.negotiate()`` on the
+        escalation path is exactly the wrong thing to do while transports are
+        already failing (it would stall the AI tier when it is needed most). For
+        TRANSPORT_TOTAL_FAILURE the negotiator's own failure context rides along
+        on ``event.details``, so we fold that in too.
+        """
+        probe: Dict[str, Any] = {}
+        mp = self._multipath
+        if mp is not None and hasattr(mp, "get_health"):
+            try:
+                health = mp.get_health()
+                probe["paths_total"] = len(health)
+                probe["paths_healthy"] = sum(
+                    1 for h in health.values() if h.get("state") == "healthy"
+                )
+                probe["all_degraded"] = bool(getattr(mp, "all_degraded", False))
+                probe["transports"] = sorted(
+                    {h.get("transport") for h in health.values() if h.get("transport")}
+                )
+            except Exception:
+                logger.warning("transport_probe: failed to read multipath health",
+                               exc_info=True)
+        if event.trigger == EscalationTrigger.TRANSPORT_TOTAL_FAILURE and event.details:
+            probe["failure"] = event.details
+        return probe or None
+
     def _build_semantic_delta(self, event: EscalationEvent) -> SemanticDelta:
         """Assemble the complete state snapshot for the LLM."""
         from matrix.autonomous import system_metrics as _system_metrics
@@ -1187,12 +1240,17 @@ class TriStateDirector:
         node_health: List[dict] = []
         if self._node_mgr and hasattr(self._node_mgr, "list_nodes"):
             try:
-                for node in self._node_mgr.list_nodes():
-                    node_health.append(
-                        self._node_mgr.get_node_health(node.node_id)
-                    )
+                nodes = self._node_mgr.list_nodes()
             except Exception:
-                logger.debug("Failed to collect node health", exc_info=True)
+                logger.warning("Failed to list nodes for delta", exc_info=True)
+                nodes = []
+            for node in nodes:
+                # Per-node so one bad node doesn't silently drop the rest.
+                try:
+                    node_health.append(self._node_mgr.get_node_health(node.node_id))
+                except Exception:
+                    logger.warning("Failed to collect health for node %s",
+                                   getattr(node, "node_id", "?"), exc_info=True)
 
         recent_failures: List[dict] = []
         if self._node_mgr and hasattr(self._node_mgr, "list_tasks"):
@@ -1226,7 +1284,7 @@ class TriStateDirector:
             path_health=path_health,
             node_health=node_health,
             recent_task_failures=recent_failures,
-            transport_probe=None,
+            transport_probe=self._build_transport_probe(event),
             adapter_mode=adapter_mode,
             adapter_metrics=adapter_metrics,
             system_metrics=sys_metrics,
@@ -1235,6 +1293,14 @@ class TriStateDirector:
 
         if not SemanticDelta.validate(delta):
             raise DirectorError("Semantic delta validation failed")
+
+        # Trigger-aware evidence check: warn (don't raise) if the trigger's
+        # expected evidence is missing — a thin delta during a real incident is
+        # still better than dropping the escalation.
+        ok, missing = SemanticDelta.validate_for_trigger(delta)
+        if not ok:
+            logger.warning("delta for %s is missing expected evidence: %s",
+                           event.trigger.value, ", ".join(missing))
 
         return delta
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import queue
+import socket
 import threading
 import time
 import uuid
@@ -194,6 +195,10 @@ class NodeManager:
         stale_threshold: float = 30.0,
         offline_threshold: float = 120.0,
         heal_cooldown: float = 30.0,
+        probe_enabled: bool = False,
+        probe_timeout: float = 2.0,
+        probe_max_per_tick: int = 8,
+        probe_fail_threshold: int = 2,
     ) -> None:
         self._local_node = local_node
         self._rbac = rbac
@@ -209,6 +214,13 @@ class NodeManager:
         self._stale_threshold = stale_threshold
         self._offline_threshold = offline_threshold
         self._heal_cooldown = heal_cooldown
+
+        # Active probing (gives the health loop evidence, not just heartbeat age)
+        self._probe_enabled = probe_enabled
+        self._probe_timeout = probe_timeout
+        self._probe_max_per_tick = probe_max_per_tick
+        self._probe_fail_threshold = probe_fail_threshold
+        self._probe_fails: Dict[str, int] = {}     # node_id → consecutive probe failures
         self._heal_campaign_id: Optional[str] = None
         self._heal_tasks: Dict[str, str] = {}      # node_id → last heal task_id
         self._heal_last: Dict[str, float] = {}     # node_id → last heal attempt ts
@@ -489,6 +501,9 @@ class NodeManager:
                 return
             node.status = status
             node.last_heartbeat = time.time()
+            if status == "online":
+                # Recovered via heartbeat — forget any prior probe-failure streak.
+                self._probe_fails.pop(node_id, None)
             if path_health is not None:
                 node.path_health = path_health
 
@@ -505,11 +520,68 @@ class NodeManager:
                 "path_health": node.path_health,
             }
 
+    def _tcp_probe(self, address: str, port: int) -> tuple[bool, Optional[float]]:
+        """Measure TCP reachability and connect latency. Pure network I/O —
+        MUST be called outside ``self._lock`` (a slow connect would otherwise
+        stall every other manager operation)."""
+        start = time.monotonic()
+        try:
+            with socket.create_connection((address, port), timeout=self._probe_timeout):
+                return True, round((time.monotonic() - start) * 1000, 2)
+        except OSError:
+            return False, None
+
+    def _recent_success_rate(self, node: ManagedNode, window: int = 20) -> dict:
+        """Success rate over the node's most recent finished tasks. Resolves the
+        task IDs in ``task_history`` against the task table. Hold ``self._lock``."""
+        done = failed = 0
+        for tid in node.task_history[-window:]:
+            task = self._tasks.get(tid)
+            if task is None:
+                continue
+            if task.status == TaskStatus.DONE:
+                done += 1
+            elif task.status == TaskStatus.FAILED:
+                failed += 1
+        total = done + failed
+        return {
+            "task_sample": total,
+            "success_rate": round(done / total, 3) if total else None,
+        }
+
+    def _probe_node(self, node_id: str) -> Optional[dict]:
+        """Probe a node's TCP reachability/latency and recent task success rate,
+        recording the result under ``node.path_health['probe']``. The network
+        probe runs outside the lock. Returns the probe dict, or None if the node
+        is unknown."""
+        with self._lock:
+            node = self._nodes.get(node_id)
+            if node is None:
+                return None
+            address, port = node.address, node.port
+            rate = self._recent_success_rate(node)
+
+        reachable, latency_ms = self._tcp_probe(address, port)
+        probe = {
+            "reachable": reachable,
+            "latency_ms": latency_ms,
+            "probed_at": time.time(),
+            **rate,
+        }
+
+        with self._lock:
+            node = self._nodes.get(node_id)
+            if node is not None:
+                # Merge under a sub-key so we don't clobber heartbeat-supplied
+                # path_health that update_node_health() may have written.
+                node.path_health = {**node.path_health, "probe": probe}
+        return probe
+
     def _health_tick(self, loop) -> None:
-        """Called by AutonomousLoop on each tick: age node health and queue
-        auto-heal tasks for degraded nodes (closed-loop healing)."""
+        """Called by AutonomousLoop on each tick: age node health, probe degraded
+        nodes for evidence, and queue auto-heal tasks (closed-loop healing)."""
         now = time.time()
-        to_heal: List[str] = []
+        to_probe: List[str] = []
         with self._lock:
             for node in self._nodes.values():
                 age = now - node.last_heartbeat
@@ -520,10 +592,44 @@ class NodeManager:
                     node.status = "offline"
                     logger.warning("node %s offline (no heartbeat for %.0fs)",
                                    node.node_id, age)
-                if node.status == "degraded" and self._auto_heal:
-                    to_heal.append(node.node_id)
-        for node_id in to_heal:
-            self._maybe_submit_heal(node_id)
+                if node.status == "degraded":
+                    to_probe.append(node.node_id)
+
+        # Active probing runs OUTSIDE the lock (network I/O). Probe evidence lets
+        # a degraded node that is also TCP-unreachable go offline before the blind
+        # offline_threshold timer, and distinguishes a network flake (reachable
+        # but heartbeat stale) from a dead node (unreachable).
+        if self._probe_enabled:
+            for node_id in to_probe[: self._probe_max_per_tick]:
+                probe = self._probe_node(node_id)
+                if not probe:
+                    continue
+                with self._lock:
+                    if probe["reachable"]:
+                        # A reachable probe clears the failure streak (flake, not death).
+                        self._probe_fails.pop(node_id, None)
+                        continue
+                    fails = self._probe_fails.get(node_id, 0) + 1
+                    self._probe_fails[node_id] = fails
+                    node = self._nodes.get(node_id)
+                    # Promote to offline only on sustained evidence: repeated probe
+                    # failures AND a stale heartbeat. One dropped probe is a flake.
+                    if (node is not None and node.status == "degraded"
+                            and fails >= self._probe_fail_threshold
+                            and time.time() - node.last_heartbeat > self._stale_threshold):
+                        node.status = "offline"
+                        self._probe_fails.pop(node_id, None)
+                        logger.warning(
+                            "node %s offline (%d consecutive failed probes, heartbeat stale)",
+                            node_id, fails)
+
+        # Re-collect degraded nodes for healing — statuses may have changed above.
+        if self._auto_heal:
+            with self._lock:
+                to_heal = [n.node_id for n in self._nodes.values()
+                           if n.status == "degraded"]
+            for node_id in to_heal:
+                self._maybe_submit_heal(node_id)
 
     def _maybe_submit_heal(self, node_id: str) -> None:
         """Queue a high-priority discovery task for a degraded node, at most

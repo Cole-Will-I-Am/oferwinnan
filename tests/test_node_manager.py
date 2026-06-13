@@ -1,5 +1,6 @@
 """Tests for node_manager.py — Node registry, task queue, and campaigns."""
 
+import socket
 import threading
 import time
 import unittest
@@ -762,6 +763,101 @@ class TestAutoHeal(unittest.TestCase):
         self.assertEqual(task.status, TaskStatus.DONE)
         self.assertIn("n1", task.result["refreshed_nodes"])
         self.assertEqual(node.status, "online")
+
+
+# ── NodeManager: active probing (#2 — give the intelligence real eyes) ────────
+
+class TestNodeManagerProbing(unittest.TestCase):
+    def setUp(self):
+        # A real listening socket on loopback = a reachable target.
+        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._listener.bind(("127.0.0.1", 0))
+        self._listener.listen(1)
+        self._open_port = self._listener.getsockname()[1]
+        # A separately-allocated-then-closed port = a refused (unreachable) target.
+        tmp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        tmp.bind(("127.0.0.1", 0))
+        self._closed_port = tmp.getsockname()[1]
+        tmp.close()
+
+    def tearDown(self):
+        self._listener.close()
+
+    def test_tcp_probe_reachable(self):
+        mgr = NodeManager(probe_timeout=1.0)
+        reachable, latency = mgr._tcp_probe("127.0.0.1", self._open_port)
+        self.assertTrue(reachable)
+        self.assertIsNotNone(latency)
+        self.assertGreaterEqual(latency, 0.0)
+
+    def test_tcp_probe_unreachable(self):
+        mgr = NodeManager(probe_timeout=1.0)
+        reachable, latency = mgr._tcp_probe("127.0.0.1", self._closed_port)
+        self.assertFalse(reachable)
+        self.assertIsNone(latency)
+
+    def test_recent_success_rate(self):
+        mgr = NodeManager()
+        node = mgr.register_node("n1", "alpha", "127.0.0.1", self._open_port)
+        for tid, status in [("t1", TaskStatus.DONE), ("t2", TaskStatus.DONE),
+                            ("t3", TaskStatus.FAILED), ("t4", TaskStatus.QUEUED)]:
+            mgr._tasks[tid] = Task(task_id=tid, task_type=TaskType.JUMP,
+                                   target_node_id="n1", status=status)
+            node.task_history.append(tid)
+        rate = mgr._recent_success_rate(node)
+        # 2 done, 1 failed (queued is ignored) → 2/3
+        self.assertEqual(rate["task_sample"], 3)
+        self.assertAlmostEqual(rate["success_rate"], 0.667, places=2)
+        _safe_stop(mgr)
+
+    def test_recent_success_rate_no_finished_tasks(self):
+        mgr = NodeManager()
+        node = mgr.register_node("n1", "alpha", "127.0.0.1")
+        rate = mgr._recent_success_rate(node)
+        self.assertEqual(rate["task_sample"], 0)
+        self.assertIsNone(rate["success_rate"])
+        _safe_stop(mgr)
+
+    def test_probe_node_writes_health_without_clobbering(self):
+        mgr = NodeManager(probe_timeout=1.0)
+        mgr.register_node("n1", "alpha", "127.0.0.1", self._open_port)
+        mgr.update_node_health("n1", "online", path_health={"latency": 5})
+        probe = mgr._probe_node("n1")
+        self.assertTrue(probe["reachable"])
+        node = mgr.get_node("n1")
+        self.assertEqual(node.path_health["latency"], 5)        # not clobbered
+        self.assertTrue(node.path_health["probe"]["reachable"])  # merged in
+        _safe_stop(mgr)
+
+    def test_probe_node_unknown_returns_none(self):
+        mgr = NodeManager()
+        self.assertIsNone(mgr._probe_node("nope"))
+        _safe_stop(mgr)
+
+    def test_evidence_promotes_unreachable_degraded_to_offline(self):
+        # stale + repeatedly unreachable → offline before the 120s age timer.
+        mgr = NodeManager(auto_heal=False, probe_enabled=True,
+                          probe_timeout=1.0, probe_fail_threshold=2)
+        node = mgr.register_node("n1", "alpha", "127.0.0.1", self._closed_port)
+        node.last_heartbeat = time.time() - 60        # stale, but < offline_threshold
+        mgr._health_tick(None)                         # → degraded, 1st failed probe
+        self.assertEqual(node.status, "degraded")
+        node.last_heartbeat = time.time() - 60         # still stale, still < 120s
+        mgr._health_tick(None)                         # 2nd failed probe → offline
+        self.assertEqual(node.status, "offline")
+        _safe_stop(mgr)
+
+    def test_reachable_probe_keeps_degraded_node(self):
+        # A degraded (stale heartbeat) but still-reachable node is a network
+        # flake, not a dead node — it must NOT be promoted to offline.
+        mgr = NodeManager(auto_heal=False, probe_enabled=True, probe_timeout=1.0,
+                          probe_fail_threshold=2)
+        node = mgr.register_node("n1", "alpha", "127.0.0.1", self._open_port)
+        node.last_heartbeat = time.time() - 60
+        mgr._health_tick(None)
+        mgr._health_tick(None)
+        self.assertEqual(node.status, "degraded")
+        _safe_stop(mgr)
 
 
 if __name__ == "__main__":

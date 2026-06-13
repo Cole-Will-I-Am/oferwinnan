@@ -524,7 +524,9 @@ def _director_start(args):
 
     # NodeManager closes the loop: health ticks, auto-heal tasks, and the
     # director's submit_task / force_session_jump tools all run through it.
-    node_mgr = NodeManager(autonomous=loop)
+    # Active probing is on in production so health decisions rest on TCP
+    # reachability + task success evidence, not just heartbeat age.
+    node_mgr = NodeManager(autonomous=loop, probe_enabled=True)
     node_mgr.start()
 
     policy = ContainmentPolicy.from_name(

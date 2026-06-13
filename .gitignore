@@ -11,3 +11,4 @@ build/
 identity.key
 known_peers.json
 *.key
+selftest-*.txt

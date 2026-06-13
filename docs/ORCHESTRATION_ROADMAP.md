@@ -10,31 +10,37 @@ enforcement, CLI wires a NodeManager into `matrix director start`.
 
 ---
 
-## #2 — Give the intelligence real eyes: active probing + `transport_probe`
+## #2 — Give the intelligence real eyes: active probing + `transport_probe`: DONE
 
-The Director's LLM makes decisions on incomplete data; node health is passive.
+The Director's LLM made decisions on incomplete data; node health was passive.
 
-- [ ] **Active node probing** — `node_manager.py` `_health_tick()` only marks
-      nodes degraded on stale heartbeat (>30s). Add a `_probe_node()` that
-      measures TCP reachability/latency to `address:port` and computes a task
-      success rate from recent `task_history`, feeding `node.path_health`.
-      Distinguishes "network flake" from "node dead" and can drive the
-      degraded→offline transition on evidence rather than just age.
-      Builds on #1: the heal loop currently relies on discovery refresh only.
-- [ ] **Populate `transport_probe`** — `director.py:1229`:
-      `SemanticDelta.transport_probe` is always `None`. Query the
-      TransportNegotiator during delta assembly so the LLM actually sees
-      transport health — especially for `TRANSPORT_TOTAL_FAILURE` escalations.
-- [ ] **Per-trigger delta validation** — `SemanticDelta.validate()`
-      (director.py:132) is type-checks only. Add `validate_for_trigger()`:
-      e.g. `TRANSPORT_TOTAL_FAILURE` requires non-null `transport_probe`,
-      `ALL_PATHS_DEGRADED` requires non-empty `path_health`,
-      `TASK_FAILURE_RATE` requires non-empty `recent_task_failures`.
-- [ ] **Don't swallow per-node health errors** during delta assembly
-      (director.py:1195) — log and continue instead of silently dropping.
+- [x] **Active node probing** — `node_manager.py` gained `_tcp_probe()`
+      (reachability + connect latency), `_recent_success_rate()` (DONE vs FAILED
+      over the last N `task_history` tasks), and `_probe_node()` which merges a
+      `probe` snapshot into `node.path_health`. `_health_tick()` now probes
+      degraded nodes **outside the lock** and promotes degraded→offline on
+      *sustained* evidence (`probe_fail_threshold` consecutive failures + stale
+      heartbeat), distinguishing a network flake (reachable but stale) from a
+      dead node. Opt-in via `probe_enabled` (on in the CLI wiring; off by default
+      so unit tests stay deterministic).
+- [x] **Populate `transport_probe`** — `TriStateDirector._build_transport_probe()`
+      summarizes MultiPath health (paths total/healthy, `all_degraded`, transport
+      list) and folds in the negotiator's `event.details` for
+      `TRANSPORT_TOTAL_FAILURE`. Derived from the existing health snapshot, **not**
+      a live re-probe — a blocking `negotiate()` on the escalation path is unsafe
+      when transports are already failing.
+- [x] **Per-trigger delta validation** — `SemanticDelta.validate_for_trigger()`
+      returns `(ok, missing)`: `TRANSPORT_TOTAL_FAILURE`→`transport_probe`,
+      `ALL_PATHS_DEGRADED`→`path_health`, `TASK_FAILURE_RATE`→`recent_task_failures`.
+      `_build_semantic_delta` logs a warning on missing evidence but still proceeds
+      (a thin delta beats dropping a real escalation).
+- [x] **Don't swallow per-node health errors** during delta assembly — node-health
+      collection is now per-node try/except at warning level, so one bad node no
+      longer drops the rest.
 
-**Unlocks:** better LLM decisions (the point of the Tri-State Director),
-path-aware failover input for multipath routing.
+**Unlocked:** better LLM decisions (the point of the Tri-State Director),
+path-aware failover input for multipath routing. Covered by 16 new tests
+(`TestNodeManagerProbing`, `TestTransportProbe`, trigger-aware delta validation).
 
 ## #3 — Production-grade LLM backend: retries, backoff, configurable limits
 
