@@ -106,6 +106,13 @@ matrix config
 # Start the Tri-State Director (LLM-augmented orchestration)
 matrix director start
 
+# Give the AI Director a high-level objective
+matrix director goal "find all nearby nodes, pick the fastest, and mirror the session"
+
+# Show the active plan and current goals
+matrix director plan
+matrix director goals
+
 # Human override / release
 matrix director override
 matrix director release
@@ -260,12 +267,56 @@ The Tri-State Director adds LLM-augmented orchestration with three tiers of auth
 | Tier | State | Description |
 |---|---|---|
 | 3 | `AUTONOMOUS` | Deterministic AutonomousLoop runs (default) |
-| 2 | `AI_ACTIVE` | LLM evaluates and acts through 7 sandboxed tools |
+| 2 | `AI_ACTIVE` | LLM evaluates and acts through sandboxed tools |
 | 1 | `HUMAN_OVERRIDE` | Human operator in direct control via CLI |
 
 Escalation triggers: fallback exhaustion, all-paths-degraded (sustained), task failure rate, transport total failure, manual. All triggers use hysteresis (cooldown + sustain windows) to prevent flapping.
 
+When escalated, the Director runs an **observe-decide-act loop**. It executes one tool at a time, feeds the result back to the LLM, and stops when the goal is achieved, the action budget is exhausted, or a human override is asserted. In-memory `DirectorGoal` and `PlanMemory` keep track of active objectives and the evolving plan.
+
+### End-to-end AI control
+
+The AI Director can drive Matrix operations directly through a sandboxed tool set:
+
+| Tool | Capability |
+|---|---|
+| `discover_devices` | Scan for nearby Matrix nodes |
+| `jump_to_target` | Initiate a session jump to a discovered device |
+| `run_remote_task` | Execute a command on a remote node |
+| `enable_persistence` / `disable_persistence` | Install or remove persistence/watchdog mechanisms |
+| `apply_disguise` | Spoof the process title to resemble a benign service |
+| `set_transport_profile` | Switch traffic mimicry profile (e.g. Slack, Teams, Discord, DoH) |
+| `probe_transport` | Probe a host/port to select a working transport |
+| `submit_relay_task` | Dispatch a task through a relay hop |
+| `sync_data` | Trigger a delta sync to a peer or dead drop |
+| `trigger_discovery`, `submit_task`, `adjust_rate_limit`, `terminate_node` | Existing orchestration tools |
+
 Safety constraints: action budget (default 5), dead-man's switch timeout, AST quarantine on all proposed code (blocks `os`/`subprocess`/`eval`/`exec`/`open`), rollback on any failure, full audit trail.
+
+### CLI
+
+```bash
+# Start the Director in autonomous/AI mode
+matrix director start
+
+# Give the AI Director a high-level objective
+matrix director goal "find all nearby nodes, pick the fastest, and mirror the session"
+
+# Show the active plan and current goals
+matrix director plan
+matrix director goals
+
+# Human override / release
+matrix director override
+matrix director release
+
+# Manual AI escalation
+matrix director escalate --reason "connectivity degraded"
+
+# View director state and audit log
+matrix director status
+matrix director audit
+```
 
 **Containment policy** (`--containment` / `MATRIX_DIRECTOR_CONTAINMENT`) bounds what the AI tier may do:
 
