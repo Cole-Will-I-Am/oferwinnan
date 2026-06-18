@@ -787,6 +787,8 @@ class JumpNode:
             elif msg_type == MsgType.TERMINATE:
                 # Termination is handled by SecureTerminator if registered
                 logger.info("received TERMINATE from %s", conn.peer_address)
+            elif msg_type == MsgType.TASK_REQUEST:
+                self._handle_task_request(conn, payload)
             else:
                 # Re-inject the already-read frame and receive session
                 conn._pending_recv.appendleft((msg_type, payload))
@@ -801,6 +803,120 @@ class JumpNode:
             logger.exception("unexpected error while handling inbound connection")
         finally:
             conn.close()
+
+    def _handle_task_request(self, conn, payload: bytes) -> None:
+        """Execute a remote shell command and stream output back."""
+        import json
+        import shlex
+        import subprocess
+
+        try:
+            req = json.loads(payload.decode())
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            conn.send_json(MsgType.TASK_ERROR, {"error": f"bad request: {exc}"})
+            return
+
+        command = req.get("command", "")
+        if not command:
+            conn.send_json(MsgType.TASK_ERROR, {"error": "empty command"})
+            return
+
+        cwd = req.get("cwd") or os.getcwd()
+        env = req.get("env")
+        timeout = req.get("timeout", 300)
+        shell = req.get("shell", True)
+
+        try:
+            proc = subprocess.Popen(
+                command if shell else shlex.split(command),
+                shell=shell,
+                cwd=cwd,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        except OSError as exc:
+            conn.send_json(MsgType.TASK_ERROR, {"error": f"exec failed: {exc}"})
+            return
+
+        try:
+            while True:
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                conn.send(MsgType.TASK_OUTPUT, line.encode())
+        except (OSError, ConnectionError):
+            pass
+        finally:
+            try:
+                proc.wait(timeout=timeout)
+                code = proc.returncode
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                code = -1
+            try:
+                conn.send_json(MsgType.TASK_DONE, {"exit_code": code})
+            except (OSError, ConnectionError):
+                pass
+
+    def run_task(
+        self,
+        target: Device,
+        command: str,
+        cwd: str = None,
+        env: dict = None,
+        timeout: float = 300.0,
+        shell: bool = True,
+        backend: Optional[TransportBackend] = None,
+    ) -> dict:
+        """Send a command to a target node and collect streamed output."""
+        import json
+
+        peer_name = f"{target.address}:{target.port}"
+        hs_kwargs = dict(
+            identity=self.identity,
+            trust_store=self.trust_store,
+            expected_peer=peer_name,
+            require_peer_identity=self.require_peer_identity,
+        )
+
+        if backend is None:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(30.0)
+            sock.connect((target.address, target.port))
+            backend = sock
+
+        try:
+            conn = client_handshake(backend, self.discovery.node_id,
+                                    self.auth_token, **hs_kwargs)
+            req = {
+                "command": command,
+                "cwd": cwd,
+                "env": env,
+                "timeout": timeout,
+                "shell": shell,
+            }
+            conn.send_json(MsgType.TASK_REQUEST, req)
+
+            output = []
+            while True:
+                msg_type, payload = conn.recv()
+                if msg_type == MsgType.TASK_OUTPUT:
+                    output.append(payload.decode())
+                elif msg_type == MsgType.TASK_DONE:
+                    info = json.loads(payload.decode())
+                    return {"exit_code": info.get("exit_code"), "output": "".join(output)}
+                elif msg_type == MsgType.TASK_ERROR:
+                    info = json.loads(payload.decode())
+                    return {"exit_code": -1, "output": "", "error": info.get("error", "")}
+                else:
+                    output.append(payload.decode())
+        finally:
+            try:
+                backend.close() if hasattr(backend, "close") else None
+            except OSError:
+                pass
 
     def start(self):
         self.discovery.start()

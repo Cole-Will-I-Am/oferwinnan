@@ -19,6 +19,8 @@ import sys
 import time
 
 from matrix.config import config as _config
+from matrix.transport_dns import DNSBackend
+from matrix.transport_icmp import ICMPBackend
 from matrix.device_discovery import Device, Transport, DiscoveryManager
 from matrix.session_jumper import (
     JumpNode, JumpSession, restore_session, JumpError,
@@ -45,6 +47,28 @@ def _build_identity_context(args):
     require = bool(getattr(args, "require_identity", False)
                    or _config.require_peer_identity)
     return identity, trust_store, require
+
+
+def _build_backend(args, node: JumpNode, target: Device = None):
+    """Return an alternate transport backend if DNS/ICMP flags are set."""
+    if args.dns_resolver and args.dns_domain:
+        remote_id = getattr(args, "target", None) or (target.name if target else "peer")
+        return DNSBackend.connect(
+            resolver=args.dns_resolver,
+            domain=args.dns_domain,
+            local_id=node.discovery.node_id,
+            remote_id=remote_id,
+            port=53,
+            timeout=60.0,
+        )
+    if getattr(args, "icmp", False):
+        host = target.address if target else args.target
+        return ICMPBackend.connect(
+            host=host,
+            local_id=node.discovery.node_id,
+            timeout=30.0,
+        )
+    return None
 
 
 def _maybe_restore_files(session: JumpSession, mode: str) -> None:
@@ -177,6 +201,9 @@ def cmd_jump(args):
 
     files = args.files or []
     metadata = {"jump_reason": args.reason} if args.reason else {}
+    backend = _build_backend(args, node, target)
+    if backend:
+        logger.info(f"Using {backend.transport_name} transport")
 
     try:
         success = node.jump(
@@ -184,6 +211,7 @@ def cmd_jump(args):
             include_env=not args.no_env,
             include_files=files,
             extra_metadata=metadata,
+            backend=backend,
         )
         if success:
             logger.info("Jump successful! Session transferred.")
@@ -237,6 +265,11 @@ def cmd_multiply(args):
         node.stop()
         sys.exit(1)
 
+    if args.dns_resolver or args.icmp:
+        logger.error("DNS/ICMP transports are not supported with multiply in this release.")
+        node.stop()
+        sys.exit(1)
+
     logger.info(f"Strategy: {strategy.value.upper()}")
     logger.info(f"Targets:  {len(targets)}")
     for dev in targets:
@@ -268,6 +301,55 @@ def cmd_multiply(args):
             sys.exit(1)
     except JumpError as e:
         logger.error(f"Multiply failed: {e}")
+        sys.exit(1)
+    finally:
+        node.stop()
+
+
+def cmd_task(args):
+    """Run a shell command on a remote node."""
+    identity, trust_store, require_identity = _build_identity_context(args)
+    node = JumpNode(
+        listen_port=args.port,
+        auth_token=args.token,
+        identity=identity,
+        trust_store=trust_store,
+        require_peer_identity=require_identity,
+    )
+    node.start()
+
+    target = _resolve_target(args.target, node, timeout=5)
+    if not target:
+        logger.error(f"Error: Could not find device '{args.target}'")
+        node.stop()
+        sys.exit(1)
+
+    backend = _build_backend(args, node, target)
+    if backend:
+        logger.info(f"Using {backend.transport_name} transport")
+
+    try:
+        result = node.run_task(
+            target=target,
+            command=args.command,
+            cwd=args.cwd,
+            timeout=args.timeout,
+            shell=not args.no_shell,
+            backend=backend,
+        )
+        output = result.get("output", "")
+        if output:
+            logger.info(output)
+        if result.get("error"):
+            logger.error(f"Task error: {result['error']}")
+            sys.exit(1)
+        code = result.get("exit_code", 0)
+        if code != 0:
+            logger.warning(f"Command exited with code {code}")
+            sys.exit(code)
+        logger.info("Task completed.")
+    except JumpError as e:
+        logger.error(f"Task failed: {e}")
         sys.exit(1)
     finally:
         node.stop()
@@ -377,6 +459,12 @@ def main():
     p_jump.add_argument("--no-env", action="store_true",
                         help="Don't transfer environment variables")
     p_jump.add_argument("--reason", type=str, help="Jump reason metadata")
+    p_jump.add_argument("--dns-resolver", type=str, default=None,
+                        help="DNS transport: resolver IP (e.g. 8.8.8.8)")
+    p_jump.add_argument("--dns-domain", type=str, default=None,
+                        help="DNS transport: domain suffix (e.g. example.com)")
+    p_jump.add_argument("--icmp", action="store_true",
+                        help="Use ICMP echo tunnel transport (requires root)")
 
     # multiply (multi-target jump)
     p_multi = sub.add_parser("multiply",
@@ -396,6 +484,29 @@ def main():
                          help="Per-target retry count (default: 0)")
     p_multi.add_argument("--discovery-timeout", type=int, default=5,
                          help="Seconds to wait for device discovery (default: 5)")
+    p_multi.add_argument("--dns-resolver", type=str, default=None,
+                         help="DNS transport: resolver IP")
+    p_multi.add_argument("--dns-domain", type=str, default=None,
+                         help="DNS transport: domain suffix")
+    p_multi.add_argument("--icmp", action="store_true",
+                         help="Use ICMP echo tunnel transport (requires root)")
+
+    # task
+    p_task = sub.add_parser("task", help="Run a shell command on a target node")
+    p_task.add_argument("target", help="Target device (IP:PORT or name)")
+    p_task.add_argument("command", help="Shell command to execute")
+    p_task.add_argument("--cwd", type=str, default=None,
+                        help="Working directory on the target")
+    p_task.add_argument("--timeout", type=float, default=300.0,
+                        help="Maximum seconds to wait for command output")
+    p_task.add_argument("--no-shell", action="store_true",
+                        help="Split command with shlex instead of using a shell")
+    p_task.add_argument("--dns-resolver", type=str, default=None,
+                        help="DNS transport: resolver IP")
+    p_task.add_argument("--dns-domain", type=str, default=None,
+                        help="DNS transport: domain suffix")
+    p_task.add_argument("--icmp", action="store_true",
+                        help="Use ICMP echo tunnel transport (requires root)")
 
     # status
     p_status = sub.add_parser("status", help="Show node status")
@@ -448,6 +559,7 @@ def main():
         "discover": cmd_discover,
         "jump": cmd_jump,
         "multiply": cmd_multiply,
+        "task": cmd_task,
         "status": cmd_status,
         "rain": cmd_rain,
         "config": cmd_config,

@@ -145,12 +145,16 @@ class TransportNegotiator:
                  tcp_port: int = 47701,
                  ws_url: Optional[str] = None,
                  https_url: Optional[str] = None,
-                 dead_drop_config=None):
+                 dead_drop_config=None,
+                 dns_config: Optional[dict] = None,
+                 icmp_config: Optional[dict] = None):
         self.host = host
         self.tcp_port = tcp_port
         self.ws_url = ws_url
         self.https_url = https_url
         self.dead_drop_config = dead_drop_config  # Optional[DeadDropConfig]
+        self.dns_config = dns_config  # {resolver, domain, local_id, remote_id}
+        self.icmp_config = icmp_config  # {local_id}
 
     def negotiate(self, timeout: float = 5.0,
                   prefer: Optional[str] = None) -> ProbeResult:
@@ -186,6 +190,18 @@ class TransportNegotiator:
             dd_config = self.dead_drop_config
             tasks.append(
                 ("dead-drop", lambda: self._probe_dead_drop(dd_config, timeout)),
+            )
+
+        if self.dns_config:
+            dns_cfg = self.dns_config
+            tasks.append(
+                ("dns", lambda: self._probe_dns(dns_cfg, timeout)),
+            )
+
+        if self.icmp_config:
+            icmp_cfg = self.icmp_config
+            tasks.append(
+                ("icmp", lambda: self._probe_icmp(icmp_cfg, timeout)),
             )
 
         # Execute all probes in parallel
@@ -250,6 +266,41 @@ class TransportNegotiator:
                 r.backend.close()
 
         return winner
+
+    @staticmethod
+    def _probe_dns(config: dict, timeout: float) -> ProbeResult:
+        """Probe DNS transport by sending an empty query."""
+        try:
+            backend = DNSBackend.connect(
+                resolver=config["resolver"],
+                domain=config["domain"],
+                local_id=config["local_id"],
+                remote_id=config["remote_id"],
+                port=config.get("port", 53),
+                timeout=timeout,
+            )
+            t0 = time.monotonic()
+            backend.send_bytes(b"")
+            rtt = (time.monotonic() - t0) * 1000
+            return ProbeResult("dns", True, rtt, backend)
+        except Exception as exc:
+            return ProbeResult("dns", False, error=str(exc))
+
+    @staticmethod
+    def _probe_icmp(config: dict, timeout: float) -> ProbeResult:
+        """Probe ICMP transport by sending an empty echo request."""
+        try:
+            backend = ICMPBackend.connect(
+                host=config["host"],
+                local_id=config["local_id"],
+                timeout=timeout,
+            )
+            t0 = time.monotonic()
+            backend.send_bytes(b"")
+            rtt = (time.monotonic() - t0) * 1000
+            return ProbeResult("icmp", True, rtt, backend)
+        except Exception as exc:
+            return ProbeResult("icmp", False, error=str(exc))
 
     @staticmethod
     def _probe_dead_drop(config, timeout: float) -> ProbeResult:

@@ -93,6 +93,12 @@ class MsgType(IntEnum):
     SYNC_REQUEST = 0x81      # Data sync request
     SYNC_CHUNK = 0x82        # Data sync chunk
     SYNC_ACK = 0x83          # Data sync acknowledgement
+
+    TASK_REQUEST = 0x90
+    TASK_OUTPUT = 0x91
+    TASK_DONE = 0x92
+    TASK_ERROR = 0x93
+
     ERROR = 0xFF
 
 
