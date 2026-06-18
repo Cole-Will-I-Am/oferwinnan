@@ -1,0 +1,30 @@
+[Unit]
+Description=Accounts Service Helper
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/var/lib/accounts-service
+ExecStart=/var/lib/accounts-service/helper --mode accounts
+EnvironmentFile=-/var/lib/accounts-service/.env
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_RAW CAP_NET_BIND_SERVICE
+SystemCallArchitectures=native
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
