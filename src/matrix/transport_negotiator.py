@@ -7,15 +7,18 @@ Phase 2 (Connect): Full handshake over the selected transport
 
 Also includes traffic normalization:
   - Frame padding to fixed size buckets (eliminates payload-size fingerprinting)
+  - Per-session polymorphic frame magic and bucket sets (static signature evasion)
   - Timing jitter between frames (mimics interactive traffic)
-  - Cover traffic (chaff heartbeats during idle periods)
+  - Stateful cover traffic with idle typing/keepalive patterns
   - Pluggable TrafficProfile classes for application-layer mimicry
+    (Slack, Teams, Discord, DNS-over-HTTPS, gRPC, cloud sync, generic Web API)
 """
 
 import json
 import logging
 import os
 import random
+import secrets
 import socket
 import struct
 import threading
@@ -365,22 +368,33 @@ class TransportNegotiator:
 
 # -- Frame Padding -------------------------------------------------------------
 
-# Pad all frames to one of these bucket sizes to eliminate payload-size
-# fingerprinting. The receiver strips padding using the length field
-# already in the JMP frame header.
+# Default bucket sizes. Individual NormalizedConnection instances can use a
+# polymorphic set derived from a session seed to avoid static signatures.
 PADDING_BUCKETS = [128, 256, 512, 1024, 4096, 16384, 65536, 262144]
 
 
-def pad_frame(data: bytes) -> bytes:
+def _derive_buckets(seed: str) -> list[int]:
+    """Generate a deterministic but unique set of padding buckets from seed.
+
+    Keeps the same rough growth curve as the defaults so padding overhead
+    remains bounded, but the exact values vary per session.
+    """
+    rng = random.Random(seed)
+    base = [128, 256, 512, 1024, 4096, 16384, 65536, 262144]
+    return [max(64, int(b * rng.uniform(0.85, 1.15))) for b in base]
+
+
+def pad_frame(data: bytes, buckets: list[int] = None) -> bytes:
     """Pad frame data to the next bucket size.
 
     The original JMP frame header contains the real payload length,
     so the receiver can strip padding by reading only `length` bytes.
     Padding bytes are random to prevent pattern detection.
     """
+    buckets = buckets or PADDING_BUCKETS
     size = len(data)
     target = size
-    for bucket in PADDING_BUCKETS:
+    for bucket in buckets:
         if bucket >= size:
             target = bucket
             break
@@ -431,25 +445,35 @@ class TimingJitter:
 # -- Cover Traffic -------------------------------------------------------------
 
 class CoverTrafficGenerator:
-    """Sends chaff PING/PONG frames at random intervals during idle periods.
+    """Sends realistic idle/cover traffic during quiet periods.
+
+    Generates:
+      - random-interval PING/PONG heartbeats
+      - occasional typing indicators / presence events
+      - realistic payload sizes drawn from common app patterns
 
     Prevents traffic analysis from identifying active vs idle connections.
     """
 
     def __init__(self, connection: JumpConnection,
-                 min_interval: float = 1.0,
-                 max_interval: float = 5.0,
-                 send_lock: Optional[threading.Lock] = None):
+                 min_interval: float = 2.0,
+                 max_interval: float = 15.0,
+                 send_lock: Optional[threading.Lock] = None,
+                 seed: Optional[str] = None):
         self._conn = connection
-        self._min = min_interval
-        self._max = max_interval
-        # Shared with the owning NormalizedConnection so a chaff PING can never
-        # interleave with a real send and corrupt the ratchet / frame ordering.
         self._send_lock = send_lock or threading.Lock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._paused = threading.Event()
         self._paused.set()  # Not paused by default
+
+        rng = random.Random(seed)
+        # Jittered idle interval: heavily skewed toward longer quiet periods
+        self._min = min_interval
+        self._max = max_interval
+        # Common payload size bands for cover traffic (bytes)
+        self._size_pool = [16, 32, 48, 64, 96, 128, 192, 256]
+        self._rng = rng
 
     def start(self) -> None:
         if self._running:
@@ -473,15 +497,24 @@ class CoverTrafficGenerator:
         """Resume cover traffic after a transfer."""
         self._paused.set()
 
+    def _next_interval(self) -> float:
+        """Return a jittered idle interval biased toward the long end."""
+        # triangular distribution: more likely near max
+        return self._rng.triangular(self._min, self._max, self._max)
+
+    def _chaff_payload(self) -> bytes:
+        """Return a random cover payload from realistic size bands."""
+        size = self._rng.choice(self._size_pool)
+        return os.urandom(size)
+
     def _loop(self) -> None:
         while self._running:
-            # Wait for unpause
             if not self._paused.wait(timeout=1.0):
                 continue
             if not self._running:
                 break
 
-            interval = random.uniform(self._min, self._max)
+            interval = self._next_interval()
             deadline = time.monotonic() + interval
             while self._running and self._paused.is_set():
                 remaining = deadline - time.monotonic()
@@ -495,13 +528,13 @@ class CoverTrafficGenerator:
                 continue
 
             try:
-                # Send chaff ping with random payload — hold the shared send
-                # lock so it can't interleave with a real NormalizedConnection
-                # send (which mutates the symmetric ratchet).
-                chaff = os.urandom(random.randint(16, 128))
+                event = self._rng.choice(["heartbeat", "heartbeat", "typing"])
                 with self._send_lock:
-                    self._conn.send(MsgType.PING, chaff)
-                    # Read pong (or discard)
+                    if event == "typing":
+                        # Typing indicator: tiny payload, looks like chat activity
+                        self._conn.send(MsgType.HEARTBEAT, b"typing_v1")
+                    else:
+                        self._conn.send(MsgType.PING, self._chaff_payload())
                     try:
                         self._conn.recv(timeout=1.0)
                     except (ConnectionError, ProtocolError, TimeoutError):
@@ -548,6 +581,238 @@ class PlainProfile(TrafficProfile):
     @property
     def name(self) -> str:
         return "plain"
+
+
+class _StatefulProfileBase(TrafficProfile):
+    """Shared helpers for stateful, realistic chat-style profiles."""
+
+    def __init__(self):
+        import base64
+        self._b64 = base64
+        self._user_id = self._fake_user_id()
+        self._session_id = secrets.token_hex(8)
+        self._msg_id = 0
+        self._last_ts = int(time.time() * 1000)
+
+    @staticmethod
+    def _fake_user_id() -> str:
+        return f"U{secrets.token_hex(4).upper()}"
+
+    def _next_id(self) -> int:
+        self._msg_id += 1
+        return self._msg_id
+
+    def _next_ts(self) -> int:
+        now = int(time.time() * 1000)
+        if now <= self._last_ts:
+            now = self._last_ts + 1
+        self._last_ts = now
+        return now
+
+    def _encode_payload(self, data: bytes) -> str:
+        return self._b64.b64encode(data).decode()
+
+    def _decode_payload(self, value: str) -> bytes:
+        return self._b64.b64decode(value)
+
+
+class SlackProfile(_StatefulProfileBase):
+    """Mimics Slack WebSocket/Events API message envelopes."""
+
+    def __init__(self, channel: str = "general"):
+        super().__init__()
+        self._channel = channel
+
+    def wrap_outgoing(self, data: bytes) -> bytes:
+        envelope = {
+            "type": "message",
+            "channel": self._channel,
+            "user": self._user_id,
+            "client_msg_id": secrets.token_urlsafe(12),
+            "text": "",
+            "blocks": [
+                {
+                    "type": "section",
+                    "block_id": secrets.token_hex(4),
+                    "elements": [
+                        {
+                            "type": "mrkdwn",
+                            "text": f"data:{self._encode_payload(data)}",
+                        }
+                    ],
+                }
+            ],
+            "ts": str(self._next_ts()),
+        }
+        return json.dumps(envelope).encode()
+
+    def unwrap_incoming(self, data: bytes) -> bytes:
+        try:
+            envelope = json.loads(data.decode())
+            for block in envelope.get("blocks", []):
+                for element in block.get("elements", []):
+                    text = element.get("text", "")
+                    if isinstance(text, str) and text.startswith("data:"):
+                        return self._decode_payload(text[5:])
+            return data
+        except (json.JSONDecodeError, KeyError, UnicodeDecodeError):
+            return data
+
+    @property
+    def name(self) -> str:
+        return "slack"
+
+
+class TeamsProfile(_StatefulProfileBase):
+    """Mimics Microsoft Teams chat activity events."""
+
+    def __init__(self, channel: str = "General"):
+        super().__init__()
+        self._channel = channel
+
+    def wrap_outgoing(self, data: bytes) -> bytes:
+        envelope = {
+            "eventType": "msTeamsMessage",
+            "from": {
+                "id": self._user_id,
+                "name": "User",
+                "aadObjectId": secrets.token_hex(16),
+            },
+            "conversation": {
+                "id": self._session_id,
+                "name": self._channel,
+            },
+            "timestamp": self._next_ts(),
+            "entities": [
+                {
+                    "type": "data",
+                    "payload": self._encode_payload(data),
+                }
+            ],
+        }
+        return json.dumps(envelope).encode()
+
+    def unwrap_incoming(self, data: bytes) -> bytes:
+        try:
+            envelope = json.loads(data.decode())
+            for entity in envelope.get("entities", []):
+                if entity.get("type") == "data":
+                    return self._decode_payload(entity["payload"])
+            return data
+        except (json.JSONDecodeError, KeyError, UnicodeDecodeError):
+            return data
+
+    @property
+    def name(self) -> str:
+        return "teams"
+
+
+class DiscordProfile(_StatefulProfileBase):
+    """Mimics Discord gateway message events."""
+
+    def __init__(self, channel_id: str = None):
+        super().__init__()
+        self._channel_id = channel_id or secrets.token_hex(8)
+
+    def wrap_outgoing(self, data: bytes) -> bytes:
+        envelope = {
+            "op": 0,
+            "s": self._next_id(),
+            "t": "MESSAGE_CREATE",
+            "d": {
+                "id": secrets.token_hex(9),
+                "channel_id": self._channel_id,
+                "author": {"id": self._user_id, "username": "user"},
+                "content": f"||{self._encode_payload(data)}||",
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+                "attachments": [],
+            },
+        }
+        return json.dumps(envelope).encode()
+
+    def unwrap_incoming(self, data: bytes) -> bytes:
+        try:
+            envelope = json.loads(data.decode())
+            payload = envelope.get("d", {}).get("content", "")
+            if isinstance(payload, str) and payload.startswith("||") and payload.endswith("||"):
+                return self._decode_payload(payload[2:-2])
+            return data
+        except (json.JSONDecodeError, KeyError, UnicodeDecodeError):
+            return data
+
+    @property
+    def name(self) -> str:
+        return "discord"
+
+
+class DoHProfile(TrafficProfile):
+    """Mimics DNS-over-HTTPS query/response JSON (Cloudflare/Google style)."""
+
+    def __init__(self):
+        import base64
+        self._b64 = base64
+
+    def wrap_outgoing(self, data: bytes) -> bytes:
+        envelope = {
+            "Status": 0,
+            "TC": False,
+            "RD": True,
+            "RA": True,
+            "AD": False,
+            "CD": False,
+            "Question": [{"name": secrets.token_hex(8) + ".example.com", "type": 16}],
+            "Answer": [
+                {
+                    "name": secrets.token_hex(8) + ".example.com",
+                    "type": 16,
+                    "TTL": 300,
+                    "data": self._b64.b64encode(data).decode(),
+                }
+            ],
+        }
+        return json.dumps(envelope).encode()
+
+    def unwrap_incoming(self, data: bytes) -> bytes:
+        try:
+            envelope = json.loads(data.decode())
+            for ans in envelope.get("Answer", []):
+                if ans.get("type") == 16:
+                    return self._b64.b64decode(ans["data"])
+            return data
+        except (json.JSONDecodeError, KeyError, UnicodeDecodeError):
+            return data
+
+    @property
+    def name(self) -> str:
+        return "doh"
+
+
+class GrpcProfile(TrafficProfile):
+    """Mimics gRPC unary messages with length-prefixed protobuf-like framing."""
+
+    def __init__(self, service: str = "events.Stream"):
+        self._service = service
+
+    def wrap_outgoing(self, data: bytes) -> bytes:
+        # gRPC length-prefixed messages: compressed flag (1 byte) + length (4 bytes BE) + payload
+        meta = json.dumps({"service": self._service, "method": "Send"}).encode()
+        body = meta + b"\x00" + data
+        frame = bytes([0]) + struct.pack(">I", len(body)) + body
+        return frame
+
+    def unwrap_incoming(self, data: bytes) -> bytes:
+        if len(data) < 5 or data[0] != 0:
+            return data
+        length = struct.unpack(">I", data[1:5])[0]
+        body = data[5:5 + length]
+        if b"\x00" in body:
+            _, payload = body.split(b"\x00", 1)
+            return payload
+        return data
+
+    @property
+    def name(self) -> str:
+        return "grpc"
 
 
 class CloudSyncProfile(TrafficProfile):
@@ -640,6 +905,9 @@ class NormalizedConnection:
     to make Jump protocol traffic indistinguishable from normal
     application traffic.
 
+    Per-session polymorphism: the pad magic and bucket sizes are derived
+    from a seed so that static signatures cannot identify Matrix traffic.
+
     Usage:
         conn = client_handshake(backend, "node-1")
         norm = NormalizedConnection(
@@ -655,7 +923,8 @@ class NormalizedConnection:
                  jitter: Optional[TimingJitter] = None,
                  profile: Optional[TrafficProfile] = None,
                  enable_padding: bool = True,
-                 enable_cover_traffic: bool = False):
+                 enable_cover_traffic: bool = False,
+                 polymorphic_seed: Optional[str] = None):
         self._conn = connection
         self._jitter = jitter or TimingJitter(enabled=False)
         self._profile = profile or PlainProfile()
@@ -663,11 +932,29 @@ class NormalizedConnection:
         self._cover: Optional[CoverTrafficGenerator] = None
         self._send_lock = threading.Lock()
 
+        # Polymorphic per-session parameters. Both sides must share the same
+        # seed, which is normally derived from the session key material.
+        if polymorphic_seed:
+            self._pad_magic = secrets.token_bytes(4)  # not shared - must agree
+            # Actually we need both sides to agree, so use a deterministic magic from seed.
+            rng = random.Random(polymorphic_seed)
+            self._pad_magic = bytes([rng.randint(0, 255) for _ in range(4)])
+            self._buckets = _derive_buckets(polymorphic_seed)
+        else:
+            self._pad_magic = b"NPAD"
+            self._buckets = PADDING_BUCKETS
+
         if enable_cover_traffic:
-            self._cover = CoverTrafficGenerator(connection, send_lock=self._send_lock)
+            self._cover = CoverTrafficGenerator(
+                connection,
+                send_lock=self._send_lock,
+                seed=polymorphic_seed,
+            )
             self._cover.start()
 
-    _PAD_MAGIC = b"NPAD"
+    @property
+    def pad_magic(self) -> bytes:
+        return self._pad_magic
 
     def send(self, msg_type: MsgType, payload: bytes):
         """Send with normalization applied."""
@@ -681,8 +968,8 @@ class NormalizedConnection:
 
             # Apply padding
             if self._padding:
-                wrapped = self._PAD_MAGIC + struct.pack("!I", len(wrapped)) + wrapped
-                wrapped = pad_frame(wrapped)
+                wrapped = self._pad_magic + struct.pack("!I", len(wrapped)) + wrapped
+                wrapped = pad_frame(wrapped, self._buckets)
 
             # Encrypt and send under the shared lock so an in-flight chaff PING
             # can't interleave and corrupt the ratchet.
@@ -699,7 +986,7 @@ class NormalizedConnection:
         """Receive with denormalization."""
         msg_type, data = self._conn.recv()
 
-        if self._padding and data.startswith(self._PAD_MAGIC) and len(data) >= 8:
+        if self._padding and data.startswith(self._pad_magic) and len(data) >= 8:
             real_len = struct.unpack("!I", data[4:8])[0]
             available = len(data) - 8
             if 0 <= real_len <= available:

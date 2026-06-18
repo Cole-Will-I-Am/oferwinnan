@@ -137,6 +137,23 @@ def _ws_write_frame(sock, opcode: int, payload: bytes, mask: bool = False):
     sock.sendall(bytes(frame))
 
 
+def _fronted_host(sni_host: str, inner_host: str) -> str:
+    """Build a domain-fronted Host header for a given SNI host.
+
+    Many CDNs and cloud front-ends allow the TLS SNI to differ from the
+    HTTP Host header. The outer (front) connection terminates on a
+    benign-looking domain while the inner Host routes to the real endpoint.
+
+    Args:
+        sni_host: Hostname used for TLS SNI and the initial connection.
+        inner_host: Real hostname to place in the HTTP Host header.
+
+    Returns:
+        The inner_host string suitable for the Host header.
+    """
+    return inner_host
+
+
 def _ws_client_handshake(sock, host: str, path: str) -> bytearray:
     """Perform a WebSocket upgrade handshake (client side).
 
@@ -565,3 +582,43 @@ class WebSocketListener:
                 sock.close()
             except OSError:
                 pass
+
+
+class DomainFrontedWebSocketBackend:
+    """Factory that creates a WebSocketBackend with split SNI/Host.
+
+    Usage:
+        backend = DomainFrontedWebSocketBackend.connect(
+            front="cdn.example.com",
+            real="my-jump.example.com",
+            path="/jump/ws",
+            port=443,
+        )
+    """
+
+    @classmethod
+    def connect(cls, front: str, real: str, path: str = "/jump/ws",
+                port: int = 443, timeout: float = 10.0) -> "WebSocketBackend":
+        """Open a TLS WebSocket to `front` but request `real` in Host header."""
+        import ssl
+        context = ssl.create_default_context()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        try:
+            secure = context.wrap_socket(sock, server_hostname=front)
+            secure.connect((front, port))
+            excess = _ws_client_handshake(secure, real, path)
+        except Exception:
+            sock.close()
+            raise
+        return WebSocketBackend(secure, is_client=True, initial_buf=excess)
+
+    @classmethod
+    def connect_url(cls, front_url: str, real_host: str) -> "WebSocketBackend":
+        """Parse a wss://front.example.com/path URL and connect with fronting."""
+        from urllib.parse import urlparse
+        parsed = urlparse(front_url)
+        host = parsed.hostname or front_url
+        port = parsed.port or (443 if parsed.scheme == "wss" else 80)
+        path = parsed.path or "/jump/ws"
+        return cls.connect(front=host, real=real_host, path=path, port=port)
