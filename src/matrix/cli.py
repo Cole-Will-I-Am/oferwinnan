@@ -589,6 +589,16 @@ def main():
     director_sub = p_director.add_subparsers(dest="director_command", required=True)
     p_director_start = director_sub.add_parser(
         "start", help="Start director alongside listener")
+    p_director_goal = director_sub.add_parser(
+        "goal", help="Assign a high-level objective to the AI Director")
+    p_director_goal.add_argument("objective", help="Objective text for the Director")
+    p_director_goal.add_argument("--max-steps", type=int, default=10,
+                                 help="Maximum tool-call steps (default: 10)")
+    director_sub.add_parser(
+        "plan", help="Show the Director's active plan and goals")
+    p_director_goals = director_sub.add_parser(
+        "goals", help="Show all Director goals")
+    p_director_goals.add_argument("goal_id", nargs="?", help="Show a specific goal")
     p_director_start.add_argument(
         "--containment",
         choices=["unrestricted", "restricted", "advisory", "disabled"],
@@ -678,6 +688,12 @@ def cmd_director(args):
 
     if subcmd == "start":
         _director_start(args)
+    elif subcmd == "goal":
+        _director_goal(args)
+    elif subcmd == "plan":
+        _director_plan(args)
+    elif subcmd == "goals":
+        _director_goals(args)
     elif subcmd == "status":
         _director_status()
     elif subcmd == "override":
@@ -688,6 +704,53 @@ def cmd_director(args):
         _director_audit()
     elif subcmd == "escalate":
         _director_escalate(args)
+
+
+def _director_goal(args):
+    """Assign an objective to the running Director."""
+    global _director_instance
+    if _director_instance is None:
+        logger.error("No Director running. Start it first: matrix director start")
+        sys.exit(1)
+    goal = _director_instance.set_goal(args.objective, max_steps=args.max_steps)
+    logger.info("Goal %s set: %s", goal.goal_id, args.objective)
+
+
+def _director_plan(args):
+    """Show the Director's active plan and goals."""
+    global _director_instance
+    if _director_instance is None:
+        logger.error("No Director running. Start it first: matrix director start")
+        sys.exit(1)
+    active = _director_instance._active_goal
+    if active:
+        logger.info("Active goal: %s", active.objective)
+        for step in active.plan:
+            mark = "✓" if step.get("done") else " "
+            logger.info("  [%s] %s: %s", mark, step["step"], step["description"])
+    else:
+        logger.info("No active goal.")
+    for g in _director_instance.list_goals():
+        if not active or g["goal_id"] != active.goal_id:
+            logger.info("  goal %s (%s): %s", g["goal_id"], g["status"], g["objective"])
+
+
+def _director_goals(args):
+    """Show all Director goals or one specific goal."""
+    global _director_instance
+    if _director_instance is None:
+        logger.error("No Director running. Start it first: matrix director start")
+        sys.exit(1)
+    if args.goal_id:
+        g = _director_instance.get_goal(args.goal_id)
+        if g:
+            logger.info(json.dumps(g, indent=2))
+        else:
+            logger.error("Goal not found: %s", args.goal_id)
+            sys.exit(1)
+    else:
+        for g in _director_instance.list_goals():
+            logger.info("%s %s (%s): %s", g["goal_id"], g["status"], g["source"], g["objective"])
 
 
 def _director_start(args):
